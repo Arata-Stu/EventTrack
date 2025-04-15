@@ -1,0 +1,14 @@
+defaults:
+  - base
+
+name: YOLOX
+model_type: DNN
+backbone:
+  name: ???
+neck:
+  name: ???
+head:
+  name: ???
+postprocess:
+  confidence_threshold: 0.1
+  nms_threshold: 0.45

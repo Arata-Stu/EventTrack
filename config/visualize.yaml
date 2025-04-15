@@ -1,0 +1,24 @@
+defaults:
+  - general
+  - model: ???   
+  - dataset: ???  
+  - _self_
+batch_size:
+  train: 1
+  eval: 1
+hardware:
+  num_workers:
+    train: 1
+    eval: 1
+  gpus: 0 
+
+output_path: outputs.mp4
+gt: False
+pred: False 
+fps: 10
+num_sequence: 1
+dataset_mode: test
+
+hydra:
+  run:
+    dir: ./outputs/visualize/${now:%Y-%m-%d}/${now:%H-%M-%S}

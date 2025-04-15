@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+  - default
+
+model:
+  backbone:
+    depth: 0.33
+    width: 0.25
+  neck:
+    depth: 0.33
