@@ -8,7 +8,6 @@ import torch as th
 from einops import rearrange
 from torch.nn.functional import pad
 
-
 class ObjectLabelBase:
     _str2idx = {
         't': 0,
@@ -18,6 +17,10 @@ class ObjectLabelBase:
         'h': 4,
         'class_id': 5,
         'class_confidence': 6,
+        'dx_prev': 7,
+        'dy_prev': 8,
+        'dx_next': 9,
+        'dy_next': 10,
     }
 
     def __init__(self,
@@ -138,12 +141,45 @@ class ObjectLabelBase:
         return self.object_labels[:, self._str2idx['class_confidence']]
 
     @property
+    def dx_prev(self):
+        return self.object_labels[:, self._str2idx['dx_prev']]
+
+    @dx_prev.setter
+    def dx_prev(self, value: Union[th.Tensor, np.ndarray]):
+        self.object_labels[:, self._str2idx['dx_prev']] = value
+
+    @property
+    def dy_prev(self):
+        return self.object_labels[:, self._str2idx['dy_prev']]
+
+    @dy_prev.setter
+    def dy_prev(self, value: Union[th.Tensor, np.ndarray]):
+        self.object_labels[:, self._str2idx['dy_prev']] = value
+
+    @property
+    def dx_next(self):
+        return self.object_labels[:, self._str2idx['dx_next']]
+
+    @dx_next.setter
+    def dx_next(self, value: Union[th.Tensor, np.ndarray]):
+        self.object_labels[:, self._str2idx['dx_next']] = value
+
+    @property
+    def dy_next(self):
+        return self.object_labels[:, self._str2idx['dy_next']]
+
+    @dy_next.setter
+    def dy_next(self, value: Union[th.Tensor, np.ndarray]):
+        self.object_labels[:, self._str2idx['dy_next']] = value
+
+    @property
     def dtype(self):
         return self.object_labels.dtype
 
     @property
     def device(self):
         return self.object_labels.device
+
 
 
 class ObjectLabelFactory(ObjectLabelBase):
@@ -245,6 +281,17 @@ class ObjectLabels(ObjectLabelBase):
         self.w = x1 - x0
         self.h = y1 - y0
 
+        ## 追加
+        disp = th.stack((self.dx_prev, self.dy_prev), dim=1)
+        disp_rot = th.einsum('ij,pj->pi', rot_matrix, disp)
+        self.dx_prev = disp_rot[:, 0]
+        self.dy_prev = disp_rot[:, 1]
+
+        disp = th.stack((self.dx_next, self.dy_next), dim=1)
+        disp_rot = th.einsum('ij,pj->pi', rot_matrix, disp)
+        self.dx_next = disp_rot[:, 0]
+        self.dy_next = disp_rot[:, 1]
+
         self.remove_flat_labels_()
 
         assert th.all(self.x >= 0)
@@ -331,6 +378,12 @@ class ObjectLabels(ObjectLabelBase):
         self.w = x1 - self.x
         self.h = y1 - self.y
 
+        # 追加：移動量 (dx, dy) もスケールする
+        self.dx_prev = self.dx_prev * scaling_multiplier
+        self.dy_prev = self.dy_prev * scaling_multiplier
+        self.dx_next = self.dx_next * scaling_multiplier
+        self.dy_next = self.dy_next * scaling_multiplier
+
         self.remove_flat_labels_()
 
     def flip_lr_(self) -> None:
@@ -338,10 +391,14 @@ class ObjectLabels(ObjectLabelBase):
             return
         self.x = self.input_size_hw[1] - 1 - self.x - self.w
 
+        self.dx_prev = -self.dx_prev
+        self.dx_next = -self.dx_next
+
     def get_labels_as_tensors(self, format_: str = 'yolox') -> th.Tensor:
         self._assert_not_numpy()
 
         if format_ == 'yolox':
+            # YOLOX形式: [class_id, center_x, center_y, w, h]
             out = th.zeros((len(self), 5), dtype=th.float32, device=self.device)
             if len(self) == 0:
                 return out
@@ -351,8 +408,27 @@ class ObjectLabels(ObjectLabelBase):
             out[:, 3] = self.w
             out[:, 4] = self.h
             return out
+
+        elif format_ == 'track':
+            # 拡張形式: YOLOX の情報に加えて dx_prev, dy_prev, dx_next, dy_next を出力
+            # 例えば、出力形式の形状を [class_id, center_x, center_y, w, h, dx_prev, dy_prev, dx_next, dy_next] とする
+            out = th.zeros((len(self), 9), dtype=th.float32, device=self.device)
+            if len(self) == 0:
+                return out
+            out[:, 0] = self.class_id
+            out[:, 1] = self.x + 0.5 * self.w
+            out[:, 2] = self.y + 0.5 * self.h
+            out[:, 3] = self.w
+            out[:, 4] = self.h
+            out[:, 5] = self.dx_prev
+            out[:, 6] = self.dy_prev
+            out[:, 7] = self.dx_next
+            out[:, 8] = self.dy_next
+            return out
+
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Format '{format_}' is not implemented.")
+
 
     @staticmethod
     def get_labels_as_batched_tensor(obj_label_list: List[ObjectLabels], format_: str = 'yolox') -> th.Tensor:
@@ -361,7 +437,7 @@ class ObjectLabels(ObjectLabelBase):
         max_num_labels_per_object_frame = max([len(x) for x in obj_label_list])
         assert max_num_labels_per_object_frame > 0
 
-        if format_ == 'yolox':
+        if format_ == 'yolox' or format_ == 'track':
             tensor_labels = []
             for labels in obj_label_list:
                 obj_labels_tensor = labels.get_labels_as_tensors(format_=format_)
@@ -371,7 +447,8 @@ class ObjectLabels(ObjectLabelBase):
             tensor_labels = th.stack(tensors=tensor_labels, dim=0)
             return tensor_labels
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Format '{format_}' is not implemented.")
+
 
 
 class SparselyBatchedObjectLabels:
