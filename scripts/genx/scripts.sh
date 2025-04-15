@@ -1,6 +1,6 @@
 #!/bin/bash
 NUM_PROCESSES=5  # set to the number of parallel processes to use
-DATA_DIR=/path/to/input
+DATA_DIR=/home/aten-22/dataset/
 DATASET=gen4 ## gen1 or gen4 or DSEC or GIFU
 DT=(5 10 20 50 100)  # Different duration values
 
@@ -19,7 +19,7 @@ else
     exit 1
 fi
 for dt in "${DT[@]}"; do
-    DEST_DIR="/path/to/output/${DATASET}_preprocessed/dt_${dt}"  # Dynamic output directory
+    DEST_DIR="/home/aten-22/dataset/${DATASET}_preprocessed/dt_${dt}"  # Dynamic output directory
     CONFIG_DURATION="conf_preprocess/extraction/duration_${dt}.yaml"  # Dynamic YAML file
 
     echo "Processing with dt=${dt}, saving to ${DEST_DIR}, using config ${CONFIG_DURATION}"
