@@ -13,7 +13,8 @@ def build_head(head_cfg: DictConfig, in_channels: Tuple[int, ...], strides: Tupl
                          in_channels=in_channels,
                          act=head_cfg.act,
                          depthwise=head_cfg.depthwise,
-                         compile_cfg=head_cfg.compile)
+                         compile_cfg=head_cfg.compile,
+                         motion_branch_mode=head_cfg.motion_branch_mode)
     else:
         raise NotImplementedError(f"Head {head_cfg.name} is not implemented")
     return head

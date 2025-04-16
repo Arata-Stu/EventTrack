@@ -68,7 +68,9 @@ def to_prophesee(loaded_label_list: LOADED_LABELS, yolox_pred_list: YOLOX_PRED_P
         loaded_labels.numpy_()
         loaded_label_proph = np.zeros((len(loaded_labels),), dtype=BBOX_DTYPE)
         for name in BBOX_DTYPE.names:
-            if name == 'track_id':
+            ## 追加
+            ## track_id, prev_dx, prev_dy, next_dx, next_dyの場合は無視
+            if name in ['track_id', 'prev_dx', 'prev_dy', 'next_dx', 'next_dy']:
                 # We don't have that and don't need it
                 continue
             loaded_label_proph[name] = np.asarray(loaded_labels.get(name), dtype=BBOX_DTYPE[name])

@@ -27,6 +27,8 @@ class YOLOXHead(nn.Module):
             act="silu",
             depthwise=False,
             compile_cfg: Optional[Dict] = None,
+            motion_branch_mode: str = None,
+            motion_loss_type: str = "l1"
     ):
         super().__init__()
 
@@ -54,6 +56,23 @@ class YOLOXHead(nn.Module):
 
         hidden_dim = int(256*width)
 
+        ## 追加
+        assert motion_branch_mode in [ None, "prev", "next", "prev+next"], f"Unsupported motion_branch_mode: {motion_branch_mode}"
+
+        self.motion_branch_mode = motion_branch_mode
+        self.motion_preds_prev = nn.ModuleList() if motion_branch_mode in ["prev", "prev+next"] else None
+        self.motion_preds_next = nn.ModuleList() if motion_branch_mode in ["next", "prev+next"] else None
+
+        self.motion_loss_type = motion_loss_type
+
+        assert self.motion_loss_type in ["none", "l1", "l2", "cosine", "l1+cosine", "l2+cosine"], \
+        f"Unsupported motion_loss_type: {self.motion_loss_type}"
+
+        # cosineを使うときは prev+next でないと成り立たない
+        if "cosine" in self.motion_loss_type:
+            assert motion_branch_mode == "prev+next", \
+                f"motion_loss_type '{self.motion_loss_type}' requires motion_branch_mode='prev+next', but got '{motion_branch_mode}'"
+        
         for i in range(len(in_channels)):
             self.stems.append(
                 BaseConv(
@@ -132,6 +151,12 @@ class YOLOXHead(nn.Module):
                 )
             )
 
+            ## 追加
+            if self.motion_preds_prev is not None:
+                self.motion_preds_prev.append(nn.Conv2d(hidden_dim, 2, 1, 1, 0))
+            if self.motion_preds_next is not None:
+                self.motion_preds_next.append(nn.Conv2d(hidden_dim, 2, 1, 1, 0))
+
         self.use_l1 = False
         self.l1_loss = nn.L1Loss(reduction="none")
         self.bcewithlog_loss = nn.BCEWithLogitsLoss(reduction="none")
@@ -184,6 +209,24 @@ class YOLOXHead(nn.Module):
             reg_output = self.reg_preds[k](reg_feat)
             obj_output = self.obj_preds[k](reg_feat)
 
+            # motion branch 推論出力（必要な場合のみ）
+            motion_feats = []
+            if self.motion_preds_prev is not None:
+                motion_feats.append(self.motion_preds_prev[k](reg_feat))
+            if self.motion_preds_next is not None:
+                motion_feats.append(self.motion_preds_next[k](reg_feat))
+
+            if motion_feats:
+                motion_cat = torch.cat(motion_feats, dim=1)  # [B, 2 or 4, H, W]
+                inference_output = torch.cat(
+                    [reg_output, obj_output.sigmoid(), cls_output.sigmoid(), motion_cat], dim=1
+                )
+            else:
+                inference_output = torch.cat(
+                    [reg_output, obj_output.sigmoid(), cls_output.sigmoid()], dim=1
+                )
+
+            # 学習用出力
             if self.training:
                 output = torch.cat([reg_output, obj_output, cls_output], 1)
                 output, grid = self.get_output_and_grid(
@@ -199,25 +242,19 @@ class YOLOXHead(nn.Module):
                 if self.use_l1:
                     batch_size = reg_output.shape[0]
                     hsize, wsize = reg_output.shape[-2:]
-                    reg_output = reg_output.view(
-                        batch_size, 1, 4, hsize, wsize
-                    )
-                    reg_output = reg_output.permute(0, 1, 3, 4, 2).reshape(
-                        batch_size, -1, 4
-                    )
-                    origin_preds.append(reg_output.clone())
+                    reg_output_l1 = reg_output.view(batch_size, 1, 4, hsize, wsize)
+                    reg_output_l1 = reg_output_l1.permute(0, 1, 3, 4, 2).reshape(batch_size, -1, 4)
+                    origin_preds.append(reg_output_l1.clone())
                 train_outputs.append(output)
-            inference_output = torch.cat(
-                [reg_output, obj_output.sigmoid(), cls_output.sigmoid()], 1
-            )
+
             inference_outputs.append(inference_output)
 
-        # --------------------------------------------------------
-        # Modification: return decoded output also during training
-        # --------------------------------------------------------
+        # ------------------------------------
+        # Decode + loss計算（訓練時のみ）
+        # ------------------------------------
         losses = None
         if self.training:
-            losses =  self.get_losses(
+            losses = self.get_losses(
                 x_shifts,
                 y_shifts,
                 expanded_strides,
@@ -226,24 +263,28 @@ class YOLOXHead(nn.Module):
                 origin_preds,
                 dtype=xin[0].dtype,
             )
-            assert len(losses) == 6
+            assert len(losses) == 7
             losses = {
                 "loss": losses[0],
                 "iou_loss": losses[1],
-                "conf_loss": losses[2], # object-ness
-                "cls_loss": losses[3], # predicted class
+                "conf_loss": losses[2],
+                "cls_loss": losses[3],
                 "l1_loss": losses[4],
                 "num_fg": losses[5],
+                "motion_loss": losses[6],  # ← 追加
             }
+
         self.hw = [x.shape[-2:] for x in inference_outputs]
-        # [batch, n_anchors_all, 85]
+
         outputs = torch.cat(
             [x.flatten(start_dim=2) for x in inference_outputs], dim=2
-        ).permute(0, 2, 1)
+        ).permute(0, 2, 1)  # → shape: (B, N_anchors, 85 [+motion])
+
         if self.decode_in_inference:
             return self.decode_outputs(outputs), losses
         else:
             return outputs, losses
+
 
     def get_output_and_grid(self, output, k, stride, dtype):
         grid = self.grids[k]
@@ -274,18 +315,28 @@ class YOLOXHead(nn.Module):
             strides = []
             for (hsize, wsize), stride in zip(self.hw, self.strides):
                 yv, xv = torch.meshgrid([torch.arange(hsize, device=device, dtype=dtype),
-                                         torch.arange(wsize, device=device, dtype=dtype)])
+                                        torch.arange(wsize, device=device, dtype=dtype)])
                 grid = torch.stack((xv, yv), 2).view(1, -1, 2)
                 grids.append(grid)
                 shape = grid.shape[:2]
                 strides.append(torch.full((*shape, 1), stride, device=device, dtype=dtype))
             self.output_grids = torch.cat(grids, dim=1)
             self.output_strides = torch.cat(strides, dim=1)
-        outputs = torch.cat([
-            (outputs[..., 0:2] + self.output_grids) * self.output_strides,
-            torch.exp(outputs[..., 2:4]) * self.output_strides,
-            outputs[..., 4:]
-        ], dim=-1)
+
+        # --- 基本的な bbox decode ---
+        bbox_xy = (outputs[..., 0:2] + self.output_grids) * self.output_strides
+        bbox_wh = torch.exp(outputs[..., 2:4]) * self.output_strides
+
+        # --- obj + clsスコア ---
+        obj_cls = outputs[..., 4:5 + self.num_classes]
+
+        # --- motionブランチ（あるなら） ---
+        if outputs.shape[-1] > 5 + self.num_classes:
+            motion = outputs[..., 5 + self.num_classes:]  # 末尾にあると仮定
+            outputs = torch.cat([bbox_xy, bbox_wh, obj_cls, motion], dim=-1)
+        else:
+            outputs = torch.cat([bbox_xy, bbox_wh, obj_cls], dim=-1)
+
         return outputs
 
     def get_losses(
@@ -300,14 +351,14 @@ class YOLOXHead(nn.Module):
     ):
         bbox_preds = outputs[:, :, :4]  # [batch, n_anchors_all, 4]
         obj_preds = outputs[:, :, 4:5]  # [batch, n_anchors_all, 1]
-        cls_preds = outputs[:, :, 5:]  # [batch, n_anchors_all, n_cls]
+        cls_preds = outputs[:, :, 5:5 + self.num_classes]  # [batch, n_anchors_all, n_cls]
+        motion_preds = outputs[:, :, 5 + self.num_classes:]  # optional: [batch, n_anchors_all, motion_dim]
 
-        # calculate targets
         nlabel = (labels.sum(dim=2) > 0).sum(dim=1)  # number of objects
 
         total_num_anchors = outputs.shape[1]
-        x_shifts = torch.cat(x_shifts, 1)  # [1, n_anchors_all]
-        y_shifts = torch.cat(y_shifts, 1)  # [1, n_anchors_all]
+        x_shifts = torch.cat(x_shifts, 1)
+        y_shifts = torch.cat(y_shifts, 1)
         expanded_strides = torch.cat(expanded_strides, 1)
         if self.use_l1:
             origin_preds = torch.cat(origin_preds, 1)
@@ -317,6 +368,7 @@ class YOLOXHead(nn.Module):
         l1_targets = []
         obj_targets = []
         fg_masks = []
+        motion_losses = []
 
         num_fg = 0.0
         num_gts = 0.0
@@ -335,57 +387,28 @@ class YOLOXHead(nn.Module):
                 gt_classes = labels[batch_idx, :num_gt, 0]
                 bboxes_preds_per_image = bbox_preds[batch_idx]
 
-                try:
-                    (
-                        gt_matched_classes,
-                        fg_mask,
-                        pred_ious_this_matching,
-                        matched_gt_inds,
-                        num_fg_img,
-                    ) = self.get_assignments(  # noqa
-                        batch_idx,
-                        num_gt,
-                        gt_bboxes_per_image,
-                        gt_classes,
-                        bboxes_preds_per_image,
-                        expanded_strides,
-                        x_shifts,
-                        y_shifts,
-                        cls_preds,
-                        obj_preds,
-                    )
-                except RuntimeError as e:
-                    # TODO: the string might change, consider a better way
-                    if "CUDA out of memory. " not in str(e):
-                        raise
+                (
+                    gt_matched_classes,
+                    fg_mask,
+                    pred_ious_this_matching,
+                    matched_gt_inds,
+                    num_fg_img,
+                ) = self.get_assignments(
+                    batch_idx,
+                    num_gt,
+                    gt_bboxes_per_image,
+                    gt_classes,
+                    bboxes_preds_per_image,
+                    expanded_strides,
+                    x_shifts,
+                    y_shifts,
+                    cls_preds,
+                    obj_preds,
+                )
 
-                    torch.cuda.empty_cache()
-                    (
-                        gt_matched_classes,
-                        fg_mask,
-                        pred_ious_this_matching,
-                        matched_gt_inds,
-                        num_fg_img,
-                    ) = self.get_assignments(  # noqa
-                        batch_idx,
-                        num_gt,
-                        gt_bboxes_per_image,
-                        gt_classes,
-                        bboxes_preds_per_image,
-                        expanded_strides,
-                        x_shifts,
-                        y_shifts,
-                        cls_preds,
-                        obj_preds,
-                        "cpu",
-                    )
-
-                torch.cuda.empty_cache()
                 num_fg += num_fg_img
 
-                cls_target = F.one_hot(
-                    gt_matched_classes.to(torch.int64), self.num_classes
-                ) * pred_ious_this_matching.unsqueeze(-1)
+                cls_target = F.one_hot(gt_matched_classes.to(torch.int64), self.num_classes) * pred_ious_this_matching.unsqueeze(-1)
                 obj_target = fg_mask.unsqueeze(-1)
                 reg_target = gt_bboxes_per_image[matched_gt_inds]
                 if self.use_l1:
@@ -396,6 +419,33 @@ class YOLOXHead(nn.Module):
                         x_shifts=x_shifts[0][fg_mask],
                         y_shifts=y_shifts[0][fg_mask],
                     )
+
+                if self.motion_loss_type != "none" and motion_preds is not None:
+                    pred_motion = motion_preds[batch_idx][fg_mask]  # shape [num_fg_img, motion_dim]
+                    gt_motion = []
+                    use_prev = self.motion_preds_prev is not None
+                    use_next = self.motion_preds_next is not None
+                    if use_prev:
+                        gt_prev = labels[batch_idx, matched_gt_inds, 8:10]
+                        gt_motion.append(gt_prev)
+                    if use_next:
+                        gt_next = labels[batch_idx, matched_gt_inds, 10:12]
+                        gt_motion.append(gt_next)
+                    if gt_motion:
+                        gt_motion = torch.cat(gt_motion, dim=1)
+
+                        if "l1" in self.motion_loss_type:
+                            motion_losses.append(F.l1_loss(pred_motion, gt_motion, reduction="sum"))
+                        elif "l2" in self.motion_loss_type:
+                            motion_losses.append(F.mse_loss(pred_motion, gt_motion, reduction="sum"))
+
+                        if "cosine" in self.motion_loss_type and use_prev and use_next:
+                            pred_prev = pred_motion[:, :2]
+                            pred_next = pred_motion[:, 2:4]
+                            pred_prev_norm = F.normalize(pred_prev, dim=-1, eps=1e-8)
+                            pred_next_norm = F.normalize(pred_next, dim=-1, eps=1e-8)
+                            loss_cos = 1.0 - F.cosine_similarity(pred_prev_norm, pred_next_norm, dim=-1)
+                            motion_losses.append(loss_cos.sum())
 
             cls_targets.append(cls_target)
             reg_targets.append(reg_target)
@@ -412,26 +462,18 @@ class YOLOXHead(nn.Module):
             l1_targets = torch.cat(l1_targets, 0)
 
         num_fg = max(num_fg, 1)
-        loss_iou = (
-            self.iou_loss(bbox_preds.view(-1, 4)[fg_masks], reg_targets)
-        ).sum() / num_fg
-        loss_obj = (
-            self.bcewithlog_loss(obj_preds.view(-1, 1), obj_targets)
-        ).sum() / num_fg
-        loss_cls = (
-            self.bcewithlog_loss(
-                cls_preds.view(-1, self.num_classes)[fg_masks], cls_targets
-            )
-        ).sum() / num_fg
+        loss_iou = self.iou_loss(bbox_preds.view(-1, 4)[fg_masks], reg_targets).sum() / num_fg
+        loss_obj = self.bcewithlog_loss(obj_preds.view(-1, 1), obj_targets).sum() / num_fg
+        loss_cls = self.bcewithlog_loss(cls_preds.view(-1, self.num_classes)[fg_masks], cls_targets).sum() / num_fg
         if self.use_l1:
-            loss_l1 = (
-                self.l1_loss(origin_preds.view(-1, 4)[fg_masks], l1_targets)
-            ).sum() / num_fg
+            loss_l1 = self.l1_loss(origin_preds.view(-1, 4)[fg_masks], l1_targets).sum() / num_fg
         else:
             loss_l1 = 0.0
 
+        loss_motion = sum(motion_losses) / num_fg if motion_losses else 0.0
+
         reg_weight = 5.0
-        loss = reg_weight * loss_iou + loss_obj + loss_cls + loss_l1
+        loss = reg_weight * loss_iou + loss_obj + loss_cls + loss_l1 + loss_motion
 
         return (
             loss,
@@ -440,6 +482,7 @@ class YOLOXHead(nn.Module):
             loss_cls,
             loss_l1,
             num_fg / max(num_gts, 1),
+            loss_motion,
         )
 
     def get_l1_target(self, l1_target, gt, stride, x_shifts, y_shifts, eps=1e-8):
