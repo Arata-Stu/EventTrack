@@ -205,6 +205,50 @@ def draw_bboxes_with_id(img, boxes, dataset_name: str) -> None:
             color_tuple_rgb = classid2colors[class_id]
             img = bbv.draw_rectangle(img, bbox, bbox_color=color_tuple_rgb)
             img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color_tuple_rgb, top=True)
+
+    if len(boxes[0]) == 9:
+        for cls_id, cx, cy, w, h, prev_dx, prev_dy, next_dx, next_dy in boxes:
+            score = 1.0
+
+            # bboxの左上・右下座標
+            pt1 = (int(cx - w / 2), int(cy - h / 2))
+            pt2 = (int(cx + w / 2), int(cy + h / 2))
+            bbox = (pt1[0], pt1[1], pt2[0], pt2[1])
+
+            # スケール補正
+            bbox = tuple(int(x * scale_multiplier) for x in bbox)
+            cx_scaled = int(cx * scale_multiplier)
+            cy_scaled = int(cy * scale_multiplier)
+
+            class_id = int(cls_id)
+            class_name = labelmap[class_id % len(labelmap)]
+            bbox_txt = class_name
+            if add_score:
+                bbox_txt += f' {score:.2f}'
+
+            color_tuple_rgb = classid2colors[class_id]
+
+            # バウンディングボックス描画
+            img = bbv.draw_rectangle(img, bbox, bbox_color=color_tuple_rgb)
+            img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color_tuple_rgb, top=True)
+
+            # 移動ベクトルの可視化（prev: 青, next: 赤）
+            arrow_tip_prev = (
+                int(cx_scaled + prev_dx * scale_multiplier),
+                int(cy_scaled + prev_dy * scale_multiplier)
+            )
+            arrow_tip_next = (
+                int(cx_scaled + next_dx * scale_multiplier),
+                int(cy_scaled + next_dy * scale_multiplier)
+            )
+
+            # 描画（OpenCV形式で矢印を描く）
+            img = cv2.arrowedLine(img, (cx_scaled, cy_scaled), arrow_tip_prev,
+                                  color=(255, 0, 0), thickness=2, tipLength=0.2)  # Blue: prev
+
+            img = cv2.arrowedLine(img, (cx_scaled, cy_scaled), arrow_tip_next,
+                                  color=(0, 0, 255), thickness=2, tipLength=0.2)  # Red: next
+
     else:
         raise ValueError("Invalid boxes format")
     
@@ -292,7 +336,8 @@ def create_video(data: pl.LightningDataModule , model: pl.LightningModule, show_
             if show_gt:
                 current_labels, valid_batch_indices = labels[tidx].get_valid_labels_and_batch_indices()
                 if len(current_labels) > 0:
-                    labels_yolox = ObjectLabels.get_labels_as_batched_tensor(obj_label_list=current_labels, format_='yolox')
+                    labels_yolox = ObjectLabels.get_labels_as_batched_tensor(obj_label_list=current_labels, format_='track')
+                    # print(labels_yolox)
 
             ## モデルの推論
             if show_pred:
