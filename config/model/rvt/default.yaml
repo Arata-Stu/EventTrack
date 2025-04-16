@@ -59,7 +59,8 @@ model:
         mode: reduce-overhead
     depthwise: False
     act: "silu"
-    motion_branch_mode: null
+    motion_branch_mode: prev+next
+    motion_loss_type: l1 ## l1, l2, cosine, l1+cosine, l2+cosine
   postprocess:
     confidence_threshold: 0.1
     nms_threshold: 0.45

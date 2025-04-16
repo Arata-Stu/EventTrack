@@ -14,7 +14,8 @@ def build_head(head_cfg: DictConfig, in_channels: Tuple[int, ...], strides: Tupl
                          act=head_cfg.act,
                          depthwise=head_cfg.depthwise,
                          compile_cfg=head_cfg.compile,
-                         motion_branch_mode=head_cfg.motion_branch_mode)
+                         motion_branch_mode=head_cfg.motion_branch_mode,
+                         motion_loss_type=head_cfg.motion_loss_type)
     else:
         raise NotImplementedError(f"Head {head_cfg.name} is not implemented")
     return head
