@@ -238,7 +238,7 @@ class YOLOXHead(nn.Module):
                 x_shifts.append(grid[:, :, 0])
                 y_shifts.append(grid[:, :, 1])
                 expanded_strides.append(
-                    torch.zeros(1, grid.shape[1], dtype=xin[0].dtype)
+                    torch.zeros(1, grid.shape[1], dtype=xin[0].dtype, device=grid.device)
                     .fill_(stride_this_level)
                 )
                 if self.use_l1:
@@ -328,7 +328,7 @@ class YOLOXHead(nn.Module):
         # xy, wh のデコード
         output[..., :2] = (output[..., :2] + grid_flat) * stride
         output[..., 2:4] = torch.exp(output[..., 2:4]) * stride
-        return output, grid
+        return output, grid_flat
 
     def decode_outputs(self, outputs):
         if self.output_grids is None:
