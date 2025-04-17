@@ -199,25 +199,21 @@ class YOLOXHead(nn.Module):
             zip(self.cls_convs, self.reg_convs, self.strides, xin)
         ):
             x = self.stems[k](x)
-            cls_x = x
-            reg_x = x
+            cls_feat = cls_conv(x)
+            reg_feat = reg_conv(x)
 
-            cls_feat = cls_conv(cls_x)
             cls_output = self.cls_preds[k](cls_feat)
-
-            reg_feat = reg_conv(reg_x)
             reg_output = self.reg_preds[k](reg_feat)
             obj_output = self.obj_preds[k](reg_feat)
 
-            # motion branch 推論出力（必要な場合のみ）
+            # --- 1. motion branch の inference 出力
             motion_feats = []
-            if self.motion_preds_prev is not None:
+            if self.motion_preds_prev:
                 motion_feats.append(self.motion_preds_prev[k](reg_feat))
-            if self.motion_preds_next is not None:
+            if self.motion_preds_next:
                 motion_feats.append(self.motion_preds_next[k](reg_feat))
-
             if motion_feats:
-                motion_cat = torch.cat(motion_feats, dim=1)  # [B, 2 or 4, H, W]
+                motion_cat = torch.cat(motion_feats, dim=1)
                 inference_output = torch.cat(
                     [reg_output, obj_output.sigmoid(), cls_output.sigmoid(), motion_cat], dim=1
                 )
@@ -226,25 +222,33 @@ class YOLOXHead(nn.Module):
                     [reg_output, obj_output.sigmoid(), cls_output.sigmoid()], dim=1
                 )
 
-            # 学習用出力
+            # --- 2. training 時に motion branch を含める
             if self.training:
-                output = torch.cat([reg_output, obj_output, cls_output], 1)
+                if motion_feats:
+                    train_out = torch.cat(
+                        [reg_output, obj_output, cls_output, motion_cat], dim=1
+                    )
+                else:
+                    train_out = torch.cat(
+                        [reg_output, obj_output, cls_output], dim=1
+                    )
                 output, grid = self.get_output_and_grid(
-                    output, k, stride_this_level, xin[0].type()
+                    train_out, k, stride_this_level, xin[0].dtype
                 )
                 x_shifts.append(grid[:, :, 0])
                 y_shifts.append(grid[:, :, 1])
                 expanded_strides.append(
-                    torch.zeros(1, grid.shape[1])
+                    torch.zeros(1, grid.shape[1], dtype=xin[0].dtype)
                     .fill_(stride_this_level)
-                    .type_as(xin[0])
                 )
                 if self.use_l1:
-                    batch_size = reg_output.shape[0]
-                    hsize, wsize = reg_output.shape[-2:]
-                    reg_output_l1 = reg_output.view(batch_size, 1, 4, hsize, wsize)
-                    reg_output_l1 = reg_output_l1.permute(0, 1, 3, 4, 2).reshape(batch_size, -1, 4)
-                    origin_preds.append(reg_output_l1.clone())
+                    batch, _, h, w = reg_output.shape
+                    l1_pred = (
+                        reg_output.view(batch, 1, 4, h, w)
+                        .permute(0,1,3,4,2)
+                        .reshape(batch, -1, 4)
+                    )
+                    origin_preds.append(l1_pred.clone())
                 train_outputs.append(output)
 
             inference_outputs.append(inference_output)
@@ -287,22 +291,40 @@ class YOLOXHead(nn.Module):
 
 
     def get_output_and_grid(self, output, k, stride, dtype):
-        grid = self.grids[k]
+        # --- チャネル数に motion_dim を反映
+        n_ch = 5 + self.num_classes
+        if self.motion_branch_mode:
+            motion_dim = (
+                (2 if 'prev' in self.motion_branch_mode else 0)
+                + (2 if 'next' in self.motion_branch_mode else 0)
+            )
+            n_ch += motion_dim
 
         batch_size = output.shape[0]
-        n_ch = 5 + self.num_classes
         hsize, wsize = output.shape[-2:]
-        if grid.shape[2:4] != output.shape[2:4]:
-            yv, xv = torch.meshgrid([torch.arange(hsize), torch.arange(wsize)])
-            grid = torch.stack((xv, yv), 2).view(1, 1, hsize, wsize, 2).type(dtype)
+
+        # --- グリッド生成
+        grid = self.grids[k]
+        if grid.shape[2:] != output.shape[2:]:
+            yv, xv = torch.meshgrid(
+                torch.arange(hsize), torch.arange(wsize)
+            )
+            grid = (
+                torch.stack((xv, yv), 2)
+                .view(1, 1, hsize, wsize, 2)
+                .type(dtype)
+            )
             self.grids[k] = grid
 
+        # --- 出力 reshape (n_ch を使用)
         output = output.view(batch_size, 1, n_ch, hsize, wsize)
-        output = output.permute(0, 1, 3, 4, 2).reshape(
-            batch_size, hsize * wsize, -1
+        output = (
+            output.permute(0,1,3,4,2)
+            .reshape(batch_size, hsize*wsize, n_ch)
         )
-        grid = grid.view(1, -1, 2)
-        output[..., :2] = (output[..., :2] + grid) * stride
+        grid_flat = grid.view(1, -1, 2)
+        # xy, wh のデコード
+        output[..., :2] = (output[..., :2] + grid_flat) * stride
         output[..., 2:4] = torch.exp(output[..., 2:4]) * stride
         return output, grid
 
