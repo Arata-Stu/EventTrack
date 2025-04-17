@@ -454,10 +454,10 @@ class YOLOXHead(nn.Module):
                     use_prev = self.motion_preds_prev is not None
                     use_next = self.motion_preds_next is not None
                     if use_prev:
-                        gt_prev = labels[batch_idx, matched_gt_inds, 8:10]
+                        gt_prev = labels[batch_idx, matched_gt_inds, 5:7]
                         gt_motion.append(gt_prev)
                     if use_next:
-                        gt_next = labels[batch_idx, matched_gt_inds, 10:12]
+                        gt_next = labels[batch_idx, matched_gt_inds, 7:9]
                         gt_motion.append(gt_next)
                     if gt_motion:
                         gt_motion = torch.cat(gt_motion, dim=1)
