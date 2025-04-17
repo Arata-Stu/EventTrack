@@ -20,236 +20,158 @@ from .network_blocks import BaseConv, DWConv
 
 class YOLOXHead(nn.Module):
     def __init__(
-            self,
-            num_classes=80,
-            strides=(8, 16, 32),
-            in_channels=(256, 512, 1024),
-            act="silu",
-            depthwise=False,
-            compile_cfg: Optional[Dict] = None,
-            motion_branch_mode: str = None,
-            motion_loss_type: str = "l1"
+        self,
+        num_classes=80,
+        strides=(8, 16, 32),
+        in_channels=(256, 512, 1024),
+        act="silu",
+        depthwise=False,
+        compile_cfg: Optional[Dict] = None,
+        motion_branch_mode: str = None,
+        motion_loss_type: str = "l1"
     ):
         super().__init__()
 
         self.num_classes = num_classes
         self.decode_in_inference = True  # for deploy, set to False
 
+        Conv = DWConv if depthwise else BaseConv
+
+        # --- 基本のモジュールリスト ---
+        self.stems = nn.ModuleList()
         self.cls_convs = nn.ModuleList()
         self.reg_convs = nn.ModuleList()
         self.cls_preds = nn.ModuleList()
         self.reg_preds = nn.ModuleList()
         self.obj_preds = nn.ModuleList()
-        self.stems = nn.ModuleList()
-        Conv = DWConv if depthwise else BaseConv
 
-        self.output_strides = None
-        self.output_grids = None
-
-        # Automatic width scaling according to original YoloX channel dims.
-        # in[-1]/out = 4/1
-        # out = in[-1]/4 = 256 * width
-        # -> width = in[-1]/1024
-        largest_base_dim_yolox = 1024
-        largest_base_dim_from_input = in_channels[-1]
-        width = largest_base_dim_from_input/largest_base_dim_yolox
-
-        hidden_dim = int(256*width)
-
-        ## 追加
-        assert motion_branch_mode in [ None, "prev", "next", "prev+next"], f"Unsupported motion_branch_mode: {motion_branch_mode}"
-
+        # --- motion branch 用のモジュールリストを追加 ---
+        assert motion_branch_mode in [None, "prev", "next", "prev+next"], \
+            f"Unsupported motion_branch_mode: {motion_branch_mode}"
         self.motion_branch_mode = motion_branch_mode
+        self.motion_convs_prev = nn.ModuleList() if motion_branch_mode in ["prev", "prev+next"] else None
+        self.motion_convs_next = nn.ModuleList() if motion_branch_mode in ["next", "prev+next"] else None
         self.motion_preds_prev = nn.ModuleList() if motion_branch_mode in ["prev", "prev+next"] else None
         self.motion_preds_next = nn.ModuleList() if motion_branch_mode in ["next", "prev+next"] else None
 
+        assert motion_loss_type in ["none", "l1", "l2", "cosine", "l1+cosine", "l2+cosine"], \
+            f"Unsupported motion_loss_type: {motion_loss_type}"
+        if "cosine" in motion_loss_type:
+            assert motion_branch_mode == "prev+next", \
+                f"motion_loss_type '{motion_loss_type}' requires 'prev+next', but got '{motion_branch_mode}'"
         self.motion_loss_type = motion_loss_type
 
-        assert self.motion_loss_type in ["none", "l1", "l2", "cosine", "l1+cosine", "l2+cosine"], \
-        f"Unsupported motion_loss_type: {self.motion_loss_type}"
+        # --- width scaling ---
+        largest_base_dim_yolox = 1024
+        width = in_channels[-1] / largest_base_dim_yolox
+        hidden_dim = int(256 * width)
 
-        # cosineを使うときは prev+next でないと成り立たない
-        if "cosine" in self.motion_loss_type:
-            assert motion_branch_mode == "prev+next", \
-                f"motion_loss_type '{self.motion_loss_type}' requires motion_branch_mode='prev+next', but got '{motion_branch_mode}'"
-        
-        for i in range(len(in_channels)):
+        # --- 各スケールごとに層を構築 ---
+        for in_ch in in_channels:
+            # Stem
             self.stems.append(
-                BaseConv(
-                    in_channels=in_channels[i],
-                    out_channels=hidden_dim,
-                    ksize=1,
-                    stride=1,
-                    act=act,
-                )
+                BaseConv(in_channels=in_ch, out_channels=hidden_dim, ksize=1, stride=1, act=act)
             )
-            self.cls_convs.append(
-                nn.Sequential(
-                    *[
-                        Conv(
-                            in_channels=hidden_dim,
-                            out_channels=hidden_dim,
-                            ksize=3,
-                            stride=1,
-                            act=act,
-                        ),
-                        Conv(
-                            in_channels=hidden_dim,
-                            out_channels=hidden_dim,
-                            ksize=3,
-                            stride=1,
-                            act=act,
-                        ),
-                    ]
-                )
-            )
-            self.reg_convs.append(
-                nn.Sequential(
-                    *[
-                        Conv(
-                            in_channels=hidden_dim,
-                            out_channels=hidden_dim,
-                            ksize=3,
-                            stride=1,
-                            act=act,
-                        ),
-                        Conv(
-                            in_channels=hidden_dim,
-                            out_channels=hidden_dim,
-                            ksize=3,
-                            stride=1,
-                            act=act,
-                        ),
-                    ]
-                )
-            )
-            self.cls_preds.append(
-                nn.Conv2d(
-                    in_channels=hidden_dim,
-                    out_channels=self.num_classes,
-                    kernel_size=1,
-                    stride=1,
-                    padding=0,
-                )
-            )
-            self.reg_preds.append(
-                nn.Conv2d(
-                    in_channels=hidden_dim,
-                    out_channels=4,
-                    kernel_size=1,
-                    stride=1,
-                    padding=0,
-                )
-            )
-            self.obj_preds.append(
-                nn.Conv2d(
-                    in_channels=hidden_dim,
-                    out_channels=1,
-                    kernel_size=1,
-                    stride=1,
-                    padding=0,
-                )
-            )
+            # Classification branch
+            self.cls_convs.append(nn.Sequential(
+                Conv(hidden_dim, hidden_dim, 3, 1, act),
+                Conv(hidden_dim, hidden_dim, 3, 1, act),
+            ))
+            self.cls_preds.append(nn.Conv2d(hidden_dim, self.num_classes, 1, 1, 0))
+            # Regression branch
+            self.reg_convs.append(nn.Sequential(
+                Conv(hidden_dim, hidden_dim, 3, 1, act),
+                Conv(hidden_dim, hidden_dim, 3, 1, act),
+            ))
+            self.reg_preds.append(nn.Conv2d(hidden_dim, 4, 1, 1, 0))
+            # Objectness branch
+            self.obj_preds.append(nn.Conv2d(hidden_dim, 1, 1, 1, 0))
 
-            ## 追加
-            if self.motion_preds_prev is not None:
+            # Motion branch: 2-layer Conv + 1×1 pred
+            if self.motion_convs_prev is not None:
+                self.motion_convs_prev.append(nn.Sequential(
+                    Conv(hidden_dim, hidden_dim, 3, 1, act),
+                    Conv(hidden_dim, hidden_dim, 3, 1, act),
+                ))
                 self.motion_preds_prev.append(nn.Conv2d(hidden_dim, 2, 1, 1, 0))
-            if self.motion_preds_next is not None:
+            if self.motion_convs_next is not None:
+                self.motion_convs_next.append(nn.Sequential(
+                    Conv(hidden_dim, hidden_dim, 3, 1, act),
+                    Conv(hidden_dim, hidden_dim, 3, 1, act),
+                ))
                 self.motion_preds_next.append(nn.Conv2d(hidden_dim, 2, 1, 1, 0))
 
+        # --- Loss 定義など ---
         self.use_l1 = False
         self.l1_loss = nn.L1Loss(reduction="none")
         self.bcewithlog_loss = nn.BCEWithLogitsLoss(reduction="none")
         self.iou_loss = IOUloss(reduction="none")
         self.strides = strides
         self.grids = [torch.zeros(1)] * len(in_channels)
-
-        # According to Focal Loss paper:
         self.initialize_biases(prior_prob=0.01)
 
-        ###### Compile if requested ######
-        if compile_cfg is not None:
-            compile_mdl = compile_cfg['enable']
-            if compile_mdl and th_compile is not None:
-                self.forward = th_compile(self.forward, **compile_cfg['args'])
-            elif compile_mdl:
-                print('Could not compile YOLOXHead because torch.compile is not available')
-        ##################################
-
-    def initialize_biases(self, prior_prob):
-        for conv in self.cls_preds:
-            b = conv.bias.view(1, -1)
-            b.data.fill_(-math.log((1 - prior_prob) / prior_prob))
-            conv.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
-
-        for conv in self.obj_preds:
-            b = conv.bias.view(1, -1)
-            b.data.fill_(-math.log((1 - prior_prob) / prior_prob))
-            conv.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+        # Optional compile
+        if compile_cfg is not None and compile_cfg.get("enable", False):
+            if th_compile is not None:
+                self.forward = th_compile(self.forward, **compile_cfg["args"])
+            else:
+                print("Could not compile YOLOXHead because torch.compile is not available")
 
     def forward(self, xin, labels=None):
-        train_outputs = []
-        inference_outputs = []
-        origin_preds = []
-        x_shifts = []
-        y_shifts = []
-        expanded_strides = []
+        train_outputs, inference_outputs = [], []
+        origin_preds, x_shifts, y_shifts, expanded_strides = [], [], [], []
 
-        for k, (cls_conv, reg_conv, stride_this_level, x) in enumerate(
-            zip(self.cls_convs, self.reg_convs, self.strides, xin)
+        for k, (stem, cls_conv, reg_conv, stride, x) in enumerate(
+            zip(self.stems, self.cls_convs, self.reg_convs, self.strides, xin)
         ):
-            x = self.stems[k](x)
+            x = stem(x)
+            # 各ブランチの特徴
             cls_feat = cls_conv(x)
             reg_feat = reg_conv(x)
 
-            cls_output = self.cls_preds[k](cls_feat)
-            reg_output = self.reg_preds[k](reg_feat)
-            obj_output = self.obj_preds[k](reg_feat)
+            # preds
+            cls_out = self.cls_preds[k](cls_feat)
+            reg_out = self.reg_preds[k](reg_feat)
+            obj_out = self.obj_preds[k](reg_feat)
 
-            # --- 1. motion branch の inference 出力
+            # --- motion branch via dedicated conv stack ---
             motion_feats = []
-            if self.motion_preds_prev:
-                motion_feats.append(self.motion_preds_prev[k](reg_feat))
-            if self.motion_preds_next:
-                motion_feats.append(self.motion_preds_next[k](reg_feat))
+            if self.motion_convs_prev is not None:
+                mv = self.motion_convs_prev[k](x)
+                motion_feats.append(self.motion_preds_prev[k](mv))
+            if self.motion_convs_next is not None:
+                mn = self.motion_convs_next[k](x)
+                motion_feats.append(self.motion_preds_next[k](mn))
+
+            # inference output 結合
             if motion_feats:
                 motion_cat = torch.cat(motion_feats, dim=1)
-                inference_output = torch.cat(
-                    [reg_output, obj_output.sigmoid(), cls_output.sigmoid(), motion_cat], dim=1
-                )
+                inf_out = torch.cat([reg_out, obj_out.sigmoid(), cls_out.sigmoid(), motion_cat], dim=1)
             else:
-                inference_output = torch.cat(
-                    [reg_output, obj_output.sigmoid(), cls_output.sigmoid()], dim=1
-                )
+                inf_out = torch.cat([reg_out, obj_out.sigmoid(), cls_out.sigmoid()], dim=1)
+            inference_outputs.append(inf_out)
 
-            # --- 2. training 時に motion branch を含める
+            # training 時の出力と grid 生成
             if self.training:
                 if motion_feats:
-                    train_out = torch.cat(
-                        [reg_output, obj_output, cls_output, motion_cat], dim=1
-                    )
+                    train_cat = torch.cat([reg_out, obj_out, cls_out, motion_cat], dim=1)
                 else:
-                    train_out = torch.cat(
-                        [reg_output, obj_output, cls_output], dim=1
-                    )
-                output, grid = self.get_output_and_grid(
-                    train_out, k, stride_this_level, xin[0].dtype
-                )
+                    train_cat = torch.cat([reg_out, obj_out, cls_out], dim=1)
+                out, grid = self.get_output_and_grid(train_cat, k, stride, xin[0].dtype)
                 x_shifts.append(grid[:, :, 0])
                 y_shifts.append(grid[:, :, 1])
                 expanded_strides.append(
-                    torch.zeros(1, grid.shape[1], dtype=xin[0].dtype, device=grid.device)
-                    .fill_(stride_this_level)
+                    torch.zeros(1, grid.shape[1], dtype=xin[0].dtype, device=grid.device).fill_(stride)
                 )
                 if self.use_l1:
-                    batch, _, h, w = reg_output.shape
-                    l1_pred = (
-                        reg_output.view(batch, 1, 4, h, w)
-                        .permute(0,1,3,4,2)
-                        .reshape(batch, -1, 4)
+                    b, _, h, w = reg_out.shape
+                    l1p = (
+                        reg_out.view(b, 1, 4, h, w)
+                               .permute(0,1,3,4,2)
+                               .reshape(b, -1, 4)
                     )
-                    origin_preds.append(l1_pred.clone())
-                train_outputs.append(output)
+                    origin_preds.append(l1p.clone())
+                train_outputs.append(out)
 
             inference_outputs.append(inference_output)
 
