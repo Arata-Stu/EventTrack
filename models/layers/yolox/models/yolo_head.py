@@ -173,8 +173,6 @@ class YOLOXHead(nn.Module):
                     origin_preds.append(l1p.clone())
                 train_outputs.append(out)
 
-            inference_outputs.append(inference_output)
-
         # ------------------------------------
         # Decode + loss計算（訓練時のみ）
         # ------------------------------------
