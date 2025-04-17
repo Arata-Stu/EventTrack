@@ -291,6 +291,10 @@ class YOLOXHead(nn.Module):
 
 
     def get_output_and_grid(self, output, k, stride, dtype):
+        # --- 出力と同じデバイス・dtype を強制
+        device = output.device
+        dtype = output.dtype
+
         # --- チャネル数に motion_dim を反映
         n_ch = 5 + self.num_classes
         if self.motion_branch_mode:
@@ -303,24 +307,22 @@ class YOLOXHead(nn.Module):
         batch_size = output.shape[0]
         hsize, wsize = output.shape[-2:]
 
-        # --- グリッド生成
+        # --- グリッド生成（必ず output と同じ device・dtype）
         grid = self.grids[k]
-        if grid.shape[2:] != output.shape[2:]:
+        if (grid.device != device or grid.dtype != dtype) or grid.shape[2:] != output.shape[2:]:
             yv, xv = torch.meshgrid(
-                torch.arange(hsize), torch.arange(wsize)
+                torch.arange(hsize, device=device, dtype=dtype),
+                torch.arange(wsize, device=device, dtype=dtype),
+                indexing='ij'
             )
-            grid = (
-                torch.stack((xv, yv), 2)
-                .view(1, 1, hsize, wsize, 2)
-                .type(dtype)
-            )
+            grid = torch.stack((xv, yv), dim=2).view(1, 1, hsize, wsize, 2)
             self.grids[k] = grid
 
         # --- 出力 reshape (n_ch を使用)
         output = output.view(batch_size, 1, n_ch, hsize, wsize)
         output = (
-            output.permute(0,1,3,4,2)
-            .reshape(batch_size, hsize*wsize, n_ch)
+            output.permute(0, 1, 3, 4, 2)
+            .reshape(batch_size, hsize * wsize, n_ch)
         )
         grid_flat = grid.view(1, -1, 2)
         # xy, wh のデコード
@@ -331,13 +333,16 @@ class YOLOXHead(nn.Module):
     def decode_outputs(self, outputs):
         if self.output_grids is None:
             assert self.output_strides is None
-            dtype = outputs.dtype
             device = outputs.device
+            dtype = outputs.dtype
             grids = []
             strides = []
             for (hsize, wsize), stride in zip(self.hw, self.strides):
-                yv, xv = torch.meshgrid([torch.arange(hsize, device=device, dtype=dtype),
-                                        torch.arange(wsize, device=device, dtype=dtype)])
+                yv, xv = torch.meshgrid(
+                    torch.arange(hsize, device=device, dtype=dtype),
+                    torch.arange(wsize, device=device, dtype=dtype),
+                    indexing='ij'
+                )
                 grid = torch.stack((xv, yv), 2).view(1, -1, 2)
                 grids.append(grid)
                 shape = grid.shape[:2]
@@ -354,12 +359,13 @@ class YOLOXHead(nn.Module):
 
         # --- motionブランチ（あるなら） ---
         if outputs.shape[-1] > 5 + self.num_classes:
-            motion = outputs[..., 5 + self.num_classes:]  # 末尾にあると仮定
+            motion = outputs[..., 5 + self.num_classes:]
             outputs = torch.cat([bbox_xy, bbox_wh, obj_cls, motion], dim=-1)
         else:
             outputs = torch.cat([bbox_xy, bbox_wh, obj_cls], dim=-1)
 
         return outputs
+
 
     def get_losses(
         self,
