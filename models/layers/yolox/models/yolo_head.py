@@ -476,25 +476,31 @@ class YOLOXHead(nn.Module):
                     )
 
                 if self.motion_loss_type != "none" and motion_preds is not None:
-                    pred_motion = motion_preds[batch_idx][fg_mask]  # shape [num_fg_img, motion_dim]
-                    gt_motion = []
-                    use_prev = self.motion_preds_prev is not None
-                    use_next = self.motion_preds_next is not None
-                    if use_prev:
+                    pred_motion = motion_preds[batch_idx][fg_mask]  # [num_fg, motion_dim]
+                    # ラベルから prev/next を切り出し
+                    if self.motion_branch_mode == "prev+next":
                         gt_prev = labels[batch_idx, matched_gt_inds, 5:7]
-                        gt_motion.append(gt_prev)
-                    if use_next:
                         gt_next = labels[batch_idx, matched_gt_inds, 7:9]
-                        gt_motion.append(gt_next)
-                    if gt_motion:
-                        gt_motion = torch.cat(gt_motion, dim=1)
+                        gt_motion = torch.cat([gt_prev, gt_next], dim=1)
+                        pred_prev = pred_motion[:, :2]
+                        pred_next = pred_motion[:, 2:4]
+                    elif self.motion_branch_mode == "prev":
+                        gt_motion = labels[batch_idx, matched_gt_inds, 5:7]
+                        pred_motion = pred_motion
+                    elif self.motion_branch_mode == "next":
+                        gt_motion = labels[batch_idx, matched_gt_inds, 7:9]
+                        pred_motion = pred_motion
+                    else:
+                        gt_motion = None
+
+                    if gt_motion is not None:
 
                         if "l1" in self.motion_loss_type:
                             motion_losses.append(F.l1_loss(pred_motion, gt_motion, reduction="sum"))
                         elif "l2" in self.motion_loss_type:
                             motion_losses.append(F.mse_loss(pred_motion, gt_motion, reduction="sum"))
 
-                        if "cosine" in self.motion_loss_type and use_prev and use_next:
+                        if "cosine" in self.motion_loss_type and self.motion_branch_mode == "prev+next":
                             pred_prev = pred_motion[:, :2]
                             pred_next = pred_motion[:, 2:4]
                             pred_prev_norm = F.normalize(pred_prev, dim=-1, eps=1e-8)
