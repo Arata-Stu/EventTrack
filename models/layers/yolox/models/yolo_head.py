@@ -49,10 +49,17 @@ class YOLOXHead(nn.Module):
         assert motion_branch_mode in [None, "prev", "next", "prev+next"], \
             f"Unsupported motion_branch_mode: {motion_branch_mode}"
         self.motion_branch_mode = motion_branch_mode
-        self.motion_convs_prev = nn.ModuleList() if motion_branch_mode in ["prev", "prev+next"] else None
-        self.motion_convs_next = nn.ModuleList() if motion_branch_mode in ["next", "prev+next"] else None
-        self.motion_preds_prev = nn.ModuleList() if motion_branch_mode in ["prev", "prev+next"] else None
-        self.motion_preds_next = nn.ModuleList() if motion_branch_mode in ["next", "prev+next"] else None
+        if motion_branch_mode == "prev+next":
+            # 1 branch で 4 チャンネル出力: [prev_dx, prev_dy, next_dx, next_dy]
+            self.motion_convs = nn.ModuleList()
+            self.motion_preds = nn.ModuleList()
+        elif motion_branch_mode in ["prev", "next"]:
+            # 1 branch で 2 チャンネル出力: [dx, dy]
+            self.motion_convs = nn.ModuleList()
+            self.motion_preds = nn.ModuleList()
+        else:
+            self.motion_convs = None
+            self.motion_preds = None
 
         assert motion_loss_type in ["none", "l1", "l2", "cosine", "l1+cosine", "l2+cosine"], \
             f"Unsupported motion_loss_type: {motion_loss_type}"
@@ -72,34 +79,88 @@ class YOLOXHead(nn.Module):
             self.stems.append(
                 BaseConv(in_channels=in_ch, out_channels=hidden_dim, ksize=1, stride=1, act=act)
             )
-            # Classification branch
-            self.cls_convs.append(nn.Sequential(
-                Conv(hidden_dim, hidden_dim, 3, 1, act),
-                Conv(hidden_dim, hidden_dim, 3, 1, act),
-            ))
-            self.cls_preds.append(nn.Conv2d(hidden_dim, self.num_classes, 1, 1, 0))
-            # Regression branch
-            self.reg_convs.append(nn.Sequential(
-                Conv(hidden_dim, hidden_dim, 3, 1, act),
-                Conv(hidden_dim, hidden_dim, 3, 1, act),
-            ))
-            self.reg_preds.append(nn.Conv2d(hidden_dim, 4, 1, 1, 0))
-            # Objectness branch
-            self.obj_preds.append(nn.Conv2d(hidden_dim, 1, 1, 1, 0))
+            self.cls_convs.append(
+                nn.Sequential(
+                    *[
+                        Conv(
+                            in_channels=hidden_dim,
+                            out_channels=hidden_dim,
+                            ksize=3,
+                            stride=1,
+                            act=act,
+                        ),
+                        Conv(
+                            in_channels=hidden_dim,
+                            out_channels=hidden_dim,
+                            ksize=3,
+                            stride=1,
+                            act=act,
+                        ),
+                    ]
+                )
+            )
+            self.reg_convs.append(
+                nn.Sequential(
+                    *[
+                        Conv(
+                            in_channels=hidden_dim,
+                            out_channels=hidden_dim,
+                            ksize=3,
+                            stride=1,
+                            act=act,
+                        ),
+                        Conv(
+                            in_channels=hidden_dim,
+                            out_channels=hidden_dim,
+                            ksize=3,
+                            stride=1,
+                            act=act,
+                        ),
+                    ]
+                )
+            )
+            self.cls_preds.append(
+                nn.Conv2d(
+                    in_channels=hidden_dim,
+                    out_channels=self.num_classes,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                )
+            )
+            self.reg_preds.append(
+                nn.Conv2d(
+                    in_channels=hidden_dim,
+                    out_channels=4,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                )
+            )
+            self.obj_preds.append(
+                nn.Conv2d(
+                    in_channels=hidden_dim,
+                    out_channels=1,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                )
+            )
 
             # Motion branch: 2-layer Conv + 1×1 pred
-            if self.motion_convs_prev is not None:
-                self.motion_convs_prev.append(nn.Sequential(
-                    Conv(hidden_dim, hidden_dim, 3, 1, act),
-                    Conv(hidden_dim, hidden_dim, 3, 1, act),
+            if self.motion_convs is not None:
+                self.motion_convs.append(nn.Sequential(
+                    Conv(in_channels=hidden_dim, out_channels=hidden_dim, ksize=3, stride=1, act=act),
+                    Conv(in_channels=hidden_dim, out_channels=hidden_dim, ksize=3, stride=1, act=act),
                 ))
-                self.motion_preds_prev.append(nn.Conv2d(hidden_dim, 2, 1, 1, 0))
-            if self.motion_convs_next is not None:
-                self.motion_convs_next.append(nn.Sequential(
-                    Conv(hidden_dim, hidden_dim, 3, 1, act),
-                    Conv(hidden_dim, hidden_dim, 3, 1, act),
+                out_ch = 4 if motion_branch_mode == "prev+next" else 2
+                self.motion_preds.append(nn.Conv2d(
+                    in_channels=hidden_dim,
+                    out_channels=out_ch,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
                 ))
-                self.motion_preds_next.append(nn.Conv2d(hidden_dim, 2, 1, 1, 0))
 
         # --- Loss 定義など ---
         self.use_l1 = False
@@ -118,14 +179,18 @@ class YOLOXHead(nn.Module):
                 print("Could not compile YOLOXHead because torch.compile is not available")
 
     def forward(self, xin, labels=None):
-        train_outputs, inference_outputs = [], []
-        origin_preds, x_shifts, y_shifts, expanded_strides = [], [], [], []
+        train_outputs = []
+        inference_outputs = []
+        origin_preds = []
+        x_shifts = []
+        y_shifts = []
+        expanded_strides = []
 
         for k, (stem, cls_conv, reg_conv, stride, x) in enumerate(
             zip(self.stems, self.cls_convs, self.reg_convs, self.strides, xin)
         ):
+            # shared feature
             x = stem(x)
-            # 各ブランチの特徴
             cls_feat = cls_conv(x)
             reg_feat = reg_conv(x)
 
@@ -134,43 +199,72 @@ class YOLOXHead(nn.Module):
             reg_out = self.reg_preds[k](reg_feat)
             obj_out = self.obj_preds[k](reg_feat)
 
-            # --- motion branch via dedicated conv stack ---
+            # --- unified motion branch ---
             motion_feats = []
-            if self.motion_convs_prev is not None:
-                mv = self.motion_convs_prev[k](x)
-                motion_feats.append(self.motion_preds_prev[k](mv))
-            if self.motion_convs_next is not None:
-                mn = self.motion_convs_next[k](x)
-                motion_feats.append(self.motion_preds_next[k](mn))
+            if self.motion_convs is not None:
+                mfeat = self.motion_convs[k](x)
+                mout = self.motion_preds[k](mfeat)  # [B,2] or [B,4]
+                if self.motion_branch_mode == "prev+next":
+                    motion_feats.append(mout[:, :2, :, :])   # prev_dx,dy
+                    motion_feats.append(mout[:, 2:4, :, :])  # next_dx,dy
+                else:
+                    motion_feats.append(mout)                # dx,dy
 
-            # inference output 結合
+            # inference output concatenation
             if motion_feats:
                 motion_cat = torch.cat(motion_feats, dim=1)
-                inf_out = torch.cat([reg_out, obj_out.sigmoid(), cls_out.sigmoid(), motion_cat], dim=1)
+                inf_out = torch.cat([
+                    reg_out,
+                    obj_out.sigmoid(),
+                    cls_out.sigmoid(),
+                    motion_cat
+                ], dim=1)
             else:
-                inf_out = torch.cat([reg_out, obj_out.sigmoid(), cls_out.sigmoid()], dim=1)
+                inf_out = torch.cat([
+                    reg_out,
+                    obj_out.sigmoid(),
+                    cls_out.sigmoid()
+                ], dim=1)
             inference_outputs.append(inf_out)
 
-            # training 時の出力と grid 生成
+            # training 時の出力 + grid
             if self.training:
                 if motion_feats:
-                    train_cat = torch.cat([reg_out, obj_out, cls_out, motion_cat], dim=1)
+                    train_cat = torch.cat([
+                        reg_out,
+                        obj_out,
+                        cls_out,
+                        motion_cat
+                    ], dim=1)
                 else:
-                    train_cat = torch.cat([reg_out, obj_out, cls_out], dim=1)
-                out, grid = self.get_output_and_grid(train_cat, k, stride, xin[0].dtype)
-                x_shifts.append(grid[:, :, 0])
-                y_shifts.append(grid[:, :, 1])
+                    train_cat = torch.cat([
+                        reg_out,
+                        obj_out,
+                        cls_out
+                    ], dim=1)
+
+                out, grid_flat = self.get_output_and_grid(train_cat, k, stride, x.dtype)
+                x_shifts.append(grid_flat[..., 0])
+                y_shifts.append(grid_flat[..., 1])
                 expanded_strides.append(
-                    torch.zeros(1, grid.shape[1], dtype=xin[0].dtype, device=grid.device).fill_(stride)
+                    torch.full(
+                        (1, grid_flat.shape[1]),
+                        stride,
+                        dtype=x.dtype,
+                        device=grid_flat.device
+                    )
                 )
+
                 if self.use_l1:
                     b, _, h, w = reg_out.shape
                     l1p = (
-                        reg_out.view(b, 1, 4, h, w)
-                               .permute(0,1,3,4,2)
-                               .reshape(b, -1, 4)
+                        reg_out
+                        .view(b, 1, 4, h, w)
+                        .permute(0, 1, 3, 4, 2)
+                        .reshape(b, -1, 4)
                     )
                     origin_preds.append(l1p.clone())
+
                 train_outputs.append(out)
 
         # ------------------------------------
@@ -178,7 +272,7 @@ class YOLOXHead(nn.Module):
         # ------------------------------------
         losses = None
         if self.training:
-            losses = self.get_losses(
+            raw_losses = self.get_losses(
                 x_shifts,
                 y_shifts,
                 expanded_strides,
@@ -187,22 +281,23 @@ class YOLOXHead(nn.Module):
                 origin_preds,
                 dtype=xin[0].dtype,
             )
-            assert len(losses) == 7
+            # raw_losses = (total, iou, conf, cls, l1, num_fg_prop, motion)
             losses = {
-                "loss": losses[0],
-                "iou_loss": losses[1],
-                "conf_loss": losses[2],
-                "cls_loss": losses[3],
-                "l1_loss": losses[4],
-                "num_fg": losses[5],
-                "motion_loss": losses[6],  # ← 追加
+                "loss":       raw_losses[0],
+                "iou_loss":   raw_losses[1],
+                "conf_loss":  raw_losses[2],
+                "cls_loss":   raw_losses[3],
+                "l1_loss":    raw_losses[4],
+                "num_fg":     raw_losses[5],
+                "motion_loss":raw_losses[6],
             }
 
-        self.hw = [x.shape[-2:] for x in inference_outputs]
-
+        # prepare for inference decode
+        self.hw = [u.shape[-2:] for u in inference_outputs]
         outputs = torch.cat(
-            [x.flatten(start_dim=2) for x in inference_outputs], dim=2
-        ).permute(0, 2, 1)  # → shape: (B, N_anchors, 85 [+motion])
+            [u.flatten(start_dim=2) for u in inference_outputs],
+            dim=2
+        ).permute(0, 2, 1)
 
         if self.decode_in_inference:
             return self.decode_outputs(outputs), losses
@@ -210,26 +305,23 @@ class YOLOXHead(nn.Module):
             return outputs, losses
 
 
+
     def get_output_and_grid(self, output, k, stride, dtype):
-        # --- 出力と同じデバイス・dtype を強制
+        # device と dtype をそろえる
         device = output.device
         dtype = output.dtype
 
-        # --- チャネル数に motion_dim を反映
+        # チャネル数に motion_dim を反映
         n_ch = 5 + self.num_classes
         if self.motion_branch_mode:
-            motion_dim = (
-                (2 if 'prev' in self.motion_branch_mode else 0)
-                + (2 if 'next' in self.motion_branch_mode else 0)
-            )
+            motion_dim = 4 if self.motion_branch_mode == "prev+next" else 2
             n_ch += motion_dim
 
-        batch_size = output.shape[0]
-        hsize, wsize = output.shape[-2:]
+        batch_size, _, hsize, wsize = output.shape
 
-        # --- グリッド生成（必ず output と同じ device・dtype）
+        # grid の生成・キャッシュ
         grid = self.grids[k]
-        if (grid.device != device or grid.dtype != dtype) or grid.shape[2:] != output.shape[2:]:
+        if (grid.device != device or grid.dtype != dtype) or grid.shape[2:] != (hsize, wsize):
             yv, xv = torch.meshgrid(
                 torch.arange(hsize, device=device, dtype=dtype),
                 torch.arange(wsize, device=device, dtype=dtype),
@@ -238,17 +330,18 @@ class YOLOXHead(nn.Module):
             grid = torch.stack((xv, yv), dim=2).view(1, 1, hsize, wsize, 2)
             self.grids[k] = grid
 
-        # --- 出力 reshape (n_ch を使用)
+        # 出力 reshape
         output = output.view(batch_size, 1, n_ch, hsize, wsize)
-        output = (
-            output.permute(0, 1, 3, 4, 2)
-            .reshape(batch_size, hsize * wsize, n_ch)
-        )
+        output = output.permute(0, 1, 3, 4, 2).reshape(batch_size, hsize * wsize, n_ch)
         grid_flat = grid.view(1, -1, 2)
-        # xy, wh のデコード
+
+        # 左上 2 チャンネルを座標にデコード
         output[..., :2] = (output[..., :2] + grid_flat) * stride
+        # 次の 2 チャンネルをサイズにデコード
         output[..., 2:4] = torch.exp(output[..., 2:4]) * stride
+
         return output, grid_flat
+
 
     def decode_outputs(self, outputs):
         if self.output_grids is None:
