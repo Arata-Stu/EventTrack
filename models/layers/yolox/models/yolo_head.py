@@ -169,6 +169,8 @@ class YOLOXHead(nn.Module):
         self.iou_loss = IOUloss(reduction="none")
         self.strides = strides
         self.grids = [torch.zeros(1)] * len(in_channels)
+        self.output_strides = None
+        self.output_grids   = None
         self.initialize_biases(prior_prob=0.01)
 
         # Optional compile
