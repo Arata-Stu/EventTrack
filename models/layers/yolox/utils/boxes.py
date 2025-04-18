@@ -75,6 +75,81 @@ def postprocess(prediction, num_classes, conf_thre=0.7, nms_thre=0.45, class_agn
 
     return output
 
+## 追加
+def postprocess_with_motion(
+    prediction: torch.Tensor,
+    num_classes: int,
+    conf_thre: float = 0.7,
+    nms_thre: float = 0.45,
+    class_agnostic: bool = False
+):
+    """
+    Args:
+        prediction: Tensor of shape [B, N, 5 + num_classes + motion_dim]
+        num_classes: クラス数 C
+        conf_thre: obj_conf × class_conf の閾値
+        nms_thre: NMS の IoU 閾値
+        class_agnostic: True ならクラス無視 NMS
+
+    Returns:
+        List of length B。各要素は Tensor [M, 7 + motion_dim] の検出結果
+        カラムは (x1, y1, x2, y2, obj_conf, class_conf, class_id[, motion...])
+    """
+    # 1) xywh→x1y1x2y2 変換
+    box_corner = prediction.new(prediction.shape)
+    box_corner[..., 0] = prediction[..., 0] - prediction[..., 2] / 2
+    box_corner[..., 1] = prediction[..., 1] - prediction[..., 3] / 2
+    box_corner[..., 2] = prediction[..., 0] + prediction[..., 2] / 2
+    box_corner[..., 3] = prediction[..., 1] + prediction[..., 3] / 2
+    prediction[..., :4] = box_corner[..., :4]
+
+    # 追加された motion チャネル数を動的に取得
+    total_ch = prediction.shape[2]
+    motion_dim = total_ch - (5 + num_classes)
+
+    output = [None] * prediction.shape[0]
+    for i, image_pred in enumerate(prediction):
+        if image_pred.numel() == 0:
+            continue
+
+        # 2) 各アンカーの最高クラススコアとそのクラス
+        class_conf, class_pred = torch.max(
+            image_pred[:, 5:5 + num_classes], dim=1, keepdim=True
+        )
+
+        # 3) obj_conf × class_conf でフィルタ
+        scores = image_pred[:, 4] * class_conf.squeeze(1)
+        mask = scores >= conf_thre
+
+        # 4) 検出候補をまとめる
+        pieces = [
+            image_pred[:, :5],         # x1,y1,x2,y2,obj_conf
+            class_conf,                # class_conf
+            class_pred.float(),        # class_id
+        ]
+        if motion_dim > 0:
+            # motion チャネルを取り出す
+            motion_preds = image_pred[:, 5 + num_classes : 5 + num_classes + motion_dim]
+            pieces.append(motion_preds)
+        detections = torch.cat(pieces, dim=1)[mask]
+
+        if detections.numel() == 0:
+            continue
+
+        # 5) NMS
+        boxes = detections[:, :4]
+        det_scores = detections[:, 4] * detections[:, 5]
+        if class_agnostic:
+            keep = torchvision.ops.nms(boxes, det_scores, nms_thre)
+        else:
+            classes = detections[:, 6]
+            keep = torchvision.ops.batched_nms(boxes, det_scores, classes, nms_thre)
+
+        detections = detections[keep]
+        output[i] = detections
+
+    return output
+
 
 def bboxes_iou(bboxes_a, bboxes_b, xyxy=True):
     if bboxes_a.shape[1] != 4 or bboxes_b.shape[1] != 4:
