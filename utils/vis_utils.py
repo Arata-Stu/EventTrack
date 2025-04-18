@@ -17,7 +17,7 @@ from data.utils.types import DatasetMode, DataType
 from data.utils.types import DataType
 from data.genx_utils.labels import ObjectLabels
 from modules.utils.detection import RNNStates
-from models.layers.yolox.utils.boxes import postprocess
+from models.layers.yolox.utils.boxes import postprocess, postprocess_with_motion
 
 LABELMAP_GEN1 = ("car", "pedestrian")
 LABELMAP_GEN4 = ('pedestrian', 'two wheeler', 'car', 'truck', 'bus', 'traffic sign', 'traffic light')
@@ -147,7 +147,6 @@ def draw_bboxes(img, boxes, labelmap=LABELMAP_GEN1) -> None:
         cv2.putText(img, class_name, (center[0], pt2[1] - 1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color)
         cv2.putText(img, str(score), (center[0], pt1[1] - 1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color)
 
-
 def draw_bboxes_with_id(img, boxes, dataset_name: str) -> None:
     """
     画像 img にバウンディングボックスを描画する関数
@@ -164,95 +163,85 @@ def draw_bboxes_with_id(img, boxes, dataset_name: str) -> None:
     dim_new_wh = (int(wd * scale_multiplier), int(ht * scale_multiplier))
     if scale_multiplier != 1:
         img = cv2.resize(img, dim_new_wh, interpolation=cv2.INTER_AREA)
-    
-    # boxes の各要素は (cls_id, cx, cy, w, h) としてループ
-    if len(boxes[0]) == 5:
+
+    # boxes のフォーマットに応じた分岐
+    num_elems = len(boxes[0])
+    if num_elems == 5:
+        # (cls_id, cx, cy, w, h)
         for cls_id, cx, cy, w, h in boxes:
             score = 1.0
-
-            # (cx, cy) を中心座標とした左上座標を計算
             pt1 = (int(cx - w / 2), int(cy - h / 2))
             pt2 = (int(cx + w / 2), int(cy + h / 2))
-            bbox = (pt1[0], pt1[1], pt2[0], pt2[1])
-
-            # スケール補正
-            bbox = tuple(int(x * scale_multiplier) for x in bbox)
-
+            bbox = tuple(int(x * scale_multiplier) for x in (*pt1, *pt2))
             class_id = int(cls_id)
             class_name = labelmap[class_id % len(labelmap)]
-            bbox_txt = class_name
-            if add_score:
-                bbox_txt += f' {score:.2f}'
-            color_tuple_rgb = classid2colors[class_id]
-            img = bbv.draw_rectangle(img, bbox, bbox_color=color_tuple_rgb)
-            img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color_tuple_rgb, top=True)
+            bbox_txt = f"{class_name} {score:.2f}" if add_score else class_name
+            color = classid2colors[class_id]
+            img = bbv.draw_rectangle(img, bbox, bbox_color=color)
+            img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
 
-    elif len(boxes[0]) == 7:
+    elif num_elems == 7:
+        # (x1, y1, x2, y2, obj_conf, class_conf, class_id)
         for x1, y1, x2, y2, obj_conf, class_conf, class_id in boxes:
             score = obj_conf * class_conf
+            bbox = tuple(int(x * scale_multiplier) for x in (x1, y1, x2, y2))
+            class_name = labelmap[int(class_id) % len(labelmap)]
+            bbox_txt = f"{class_name} {score:.2f}" if add_score else class_name
+            color = classid2colors[int(class_id)]
+            img = bbv.draw_rectangle(img, bbox, bbox_color=color)
+            img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
 
-            pt1 = (int(x1), int(y1))
-            pt2 = (int(x2), int(y2))
-            bbox = (pt1[0], pt1[1], pt2[0], pt2[1])
-
-            bbox = tuple(int(x * scale_multiplier) for x in bbox)
-
-            class_id = int(class_id)
-            class_name = labelmap[class_id % len(labelmap)]
-            bbox_txt = class_name
-            if add_score:
-                bbox_txt += f' {score:.2f}'
-            color_tuple_rgb = classid2colors[class_id]
-            img = bbv.draw_rectangle(img, bbox, bbox_color=color_tuple_rgb)
-            img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color_tuple_rgb, top=True)
-
-    if len(boxes[0]) == 9:
+    elif num_elems == 9:
+        # (cls_id, cx, cy, w, h, prev_dx, prev_dy, next_dx, next_dy)
         for cls_id, cx, cy, w, h, prev_dx, prev_dy, next_dx, next_dy in boxes:
             score = 1.0
-
-            # bboxの左上・右下座標
             pt1 = (int(cx - w / 2), int(cy - h / 2))
             pt2 = (int(cx + w / 2), int(cy + h / 2))
-            bbox = (pt1[0], pt1[1], pt2[0], pt2[1])
-
-            # スケール補正
-            bbox = tuple(int(x * scale_multiplier) for x in bbox)
-            cx_scaled = int(cx * scale_multiplier)
-            cy_scaled = int(cy * scale_multiplier)
-
+            bbox = tuple(int(x * scale_multiplier) for x in (*pt1, *pt2))
+            cx_s, cy_s = int(cx * scale_multiplier), int(cy * scale_multiplier)
             class_id = int(cls_id)
             class_name = labelmap[class_id % len(labelmap)]
-            bbox_txt = class_name
-            if add_score:
-                bbox_txt += f' {score:.2f}'
+            bbox_txt = f"{class_name} {score:.2f}" if add_score else class_name
+            color = classid2colors[class_id]
+            img = bbv.draw_rectangle(img, bbox, bbox_color=color)
+            img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
+            # prev (blue), next (red)
+            img = cv2.arrowedLine(img, (cx_s, cy_s),
+                                  (cx_s + int(prev_dx * scale_multiplier), cy_s + int(prev_dy * scale_multiplier)),
+                                  color=(255, 0, 0), thickness=2, tipLength=0.2)
+            img = cv2.arrowedLine(img, (cx_s, cy_s),
+                                  (cx_s + int(next_dx * scale_multiplier), cy_s + int(next_dy * scale_multiplier)),
+                                  color=(0, 0, 255), thickness=2, tipLength=0.2)
 
-            color_tuple_rgb = classid2colors[class_id]
-
-            # バウンディングボックス描画
-            img = bbv.draw_rectangle(img, bbox, bbox_color=color_tuple_rgb)
-            img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color_tuple_rgb, top=True)
-
-            # 移動ベクトルの可視化（prev: 青, next: 赤）
-            arrow_tip_prev = (
-                int(cx_scaled + prev_dx * scale_multiplier),
-                int(cy_scaled + prev_dy * scale_multiplier)
-            )
-            arrow_tip_next = (
-                int(cx_scaled + next_dx * scale_multiplier),
-                int(cy_scaled + next_dy * scale_multiplier)
-            )
-
-            # 描画（OpenCV形式で矢印を描く）
-            img = cv2.arrowedLine(img, (cx_scaled, cy_scaled), arrow_tip_prev,
-                                  color=(255, 0, 0), thickness=2, tipLength=0.2)  # Blue: prev
-
-            img = cv2.arrowedLine(img, (cx_scaled, cy_scaled), arrow_tip_next,
-                                  color=(0, 0, 255), thickness=2, tipLength=0.2)  # Red: next
+    elif num_elems == 11:
+        # (cls_id, cx, cy, w, h, dx, dy, prev_dx, prev_dy, next_dx, next_dy)
+        for cls_id, cx, cy, w, h, dx, dy, prev_dx, prev_dy, next_dx, next_dy in boxes:
+            score = 1.0
+            pt1 = (int(cx - w / 2), int(cy - h / 2))
+            pt2 = (int(cx + w / 2), int(cy + h / 2))
+            bbox = tuple(int(x * scale_multiplier) for x in (*pt1, *pt2))
+            cx_s, cy_s = int(cx * scale_multiplier), int(cy * scale_multiplier)
+            class_id = int(cls_id)
+            class_name = labelmap[class_id % len(labelmap)]
+            bbox_txt = f"{class_name} {score:.2f}" if add_score else class_name
+            color = classid2colors[class_id]
+            img = bbv.draw_rectangle(img, bbox, bbox_color=color)
+            img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
+            # current (green), prev (blue), next (red)
+            for vec, col in [
+                ((dx, dy), (0, 255, 0)),
+                ((prev_dx, prev_dy), (255, 0, 0)),
+                ((next_dx, next_dy), (0, 0, 255))
+            ]:
+                tip = (cx_s + int(vec[0] * scale_multiplier), cy_s + int(vec[1] * scale_multiplier))
+                img = cv2.arrowedLine(img, (cx_s, cy_s), tip,
+                                      color=col, thickness=2, tipLength=0.2)
 
     else:
-        raise ValueError("Invalid boxes format")
-    
+        raise ValueError(f"Invalid boxes format: got length {num_elems}")
+
     return img
+
 
 
 
@@ -272,6 +261,8 @@ def visualize(video_writer: cv2.VideoWriter, ev_tensors: torch.Tensor, labels_yo
 def create_video(data: pl.LightningDataModule , model: pl.LightningModule, show_gt: bool, show_pred: bool, output_path: str, fps: int, num_sequence: int, dataset_mode: DatasetMode):  
 
     data_size =  dataset2size[data.dataset_name]
+    ## yolox or track
+    format = model.mdl_config.label.format
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     video_writer = cv2.VideoWriter(output_path, fourcc, fps, data_size)
@@ -336,7 +327,7 @@ def create_video(data: pl.LightningDataModule , model: pl.LightningModule, show_
             if show_gt:
                 current_labels, valid_batch_indices = labels[tidx].get_valid_labels_and_batch_indices()
                 if len(current_labels) > 0:
-                    labels_yolox = ObjectLabels.get_labels_as_batched_tensor(obj_label_list=current_labels, format_='track')
+                    labels_yolox = ObjectLabels.get_labels_as_batched_tensor(obj_label_list=current_labels, format_=format)
                     # print(labels_yolox)
 
             ## モデルの推論
@@ -349,7 +340,10 @@ def create_video(data: pl.LightningDataModule , model: pl.LightningModule, show_
                     prev_states = states
                     rnn_state.save_states_and_detach(worker_id=0, states=prev_states)
                 
-                pred_processed = postprocess(prediction=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
+                if format == 'yolox':
+                    pred_processed = postprocess(predictions=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
+                elif format == 'track':
+                    pred_processed = postprocess_with_motion(prediction=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
 
             ## 可視化
             visualize(video_writer, ev_tensors, labels_yolox, pred_processed, data.dataset_name)
