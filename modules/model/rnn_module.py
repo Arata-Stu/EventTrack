@@ -161,7 +161,7 @@ class ModelModule(pl.LightningModule):
         assert len(obj_labels) > 0
         # Batch the backbone features and labels to parallelize the detection code.
         selected_backbone_features = backbone_feature_selector.get_batched_backbone_features()
-        labels_yolox = ObjectLabels.get_labels_as_batched_tensor(obj_label_list=obj_labels, format_='track')
+        labels_yolox = ObjectLabels.get_labels_as_batched_tensor(obj_label_list=obj_labels, format_=self.mdl_config.label.format)
         labels_yolox = labels_yolox.to(dtype=self.dtype)
 
         neck_features = self.mdl.forward_neck(backbone_features=selected_backbone_features)

@@ -62,3 +62,6 @@ model:
   postprocess:
     confidence_threshold: 0.1
     nms_threshold: 0.45
+
+  label:
+    format: track ## yolox or track 
