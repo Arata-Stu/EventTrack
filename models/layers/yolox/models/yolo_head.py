@@ -486,15 +486,15 @@ class YOLOXHead(nn.Module):
                 if self.motion_loss_type != "none" and motion_preds is not None:
                     pred_motion = motion_preds[batch_idx][fg_mask]  # [num_fg_img, motion_dim]
 
-                    # GT から prev/next の抽出
+                    # GT motion 抽出
                     if self.motion_branch_mode == "prev+next":
                         gt_prev = labels[batch_idx, matched_gt_inds, 5:7]
                         gt_next = labels[batch_idx, matched_gt_inds, 7:9]
-                        gt_motion = torch.cat([gt_prev, gt_next], dim=1)  # [num_fg_img,4]
+                        gt_motion = torch.cat([gt_prev, gt_next], dim=1)
                     elif self.motion_branch_mode == "prev":
-                        gt_motion = labels[batch_idx, matched_gt_inds, 5:7]  # [num_fg_img,2]
+                        gt_motion = labels[batch_idx, matched_gt_inds, 5:7]
                     elif self.motion_branch_mode == "next":
-                        gt_motion = labels[batch_idx, matched_gt_inds, 7:9]  # [num_fg_img,2]
+                        gt_motion = labels[batch_idx, matched_gt_inds, 7:9]
                     else:
                         gt_motion = None
 
@@ -504,22 +504,59 @@ class YOLOXHead(nn.Module):
                         and gt_motion.numel() > 0
                         and gt_motion.shape[-1] == pred_motion.shape[-1]
                     ):
-                        # --- ここから改訂版：prev/next 個別チェック ---
+                        # --- 改訂版: 信頼できる motion のみ使用 ---
                         if self.motion_branch_mode == "prev+next":
-                            # prev, next それぞれの距離を計算
-                            dist_prev = torch.norm(gt_motion[:, :2], dim=1)
-                            dist_next = torch.norm(gt_motion[:, 2:4], dim=1)
-                            reliable_mask = (dist_prev <= 50.0) & (dist_next <= 50.0)
+                            gt_dx_prev, gt_dy_prev = gt_motion[:, 0], gt_motion[:, 1]
+                            gt_dx_next, gt_dy_next = gt_motion[:, 2], gt_motion[:, 3]
+                            mag_prev = torch.norm(gt_motion[:, :2], dim=1)
+                            mag_next = torch.norm(gt_motion[:, 2:4], dim=1)
+
+                            # 非対称性チェック
+                            eps = 1e-6
+                            ratio_prev = torch.maximum(
+                                torch.abs(gt_dx_prev) / (torch.abs(gt_dy_prev) + eps),
+                                torch.abs(gt_dy_prev) / (torch.abs(gt_dx_prev) + eps)
+                            )
+                            ratio_next = torch.maximum(
+                                torch.abs(gt_dx_next) / (torch.abs(gt_dy_next) + eps),
+                                torch.abs(gt_dy_next) / (torch.abs(gt_dx_next) + eps)
+                            )
+
+                            # 各条件のマスク
+                            mask_prev = (
+                                (mag_prev <= 20.0)
+                                & (ratio_prev <= 10.0)
+                                & (torch.abs(gt_dx_prev) <= 30.0)
+                                & (torch.abs(gt_dy_prev) <= 30.0)
+                            )
+                            mask_next = (
+                                (mag_next <= 20.0)
+                                & (ratio_next <= 10.0)
+                                & (torch.abs(gt_dx_next) <= 30.0)
+                                & (torch.abs(gt_dy_next) <= 30.0)
+                            )
+
+                            reliable_mask = mask_prev & mask_next
+
                         else:
-                            # prev または next 単独の場合
-                            reliable_mask = torch.norm(gt_motion, dim=1) <= 50.0
+                            # 単独の prev or next モード
+                            gt_dx, gt_dy = gt_motion[:, 0], gt_motion[:, 1]
+                            mag = torch.norm(gt_motion, dim=1)
+                            ratio = torch.maximum(
+                                torch.abs(gt_dx) / (torch.abs(gt_dy) + 1e-6),
+                                torch.abs(gt_dy) / (torch.abs(gt_dx) + 1e-6)
+                            )
+                            reliable_mask = (
+                                (mag <= 20.0)
+                                & (ratio <= 10.0)
+                                & (torch.abs(gt_dx) <= 30.0)
+                                & (torch.abs(gt_dy) <= 30.0)
+                            )
 
                         if reliable_mask.sum() > 0:
-                            # 信頼できるサンプルのみフィルタ
                             pred_motion_f = pred_motion[reliable_mask]
                             gt_motion_f   = gt_motion[reliable_mask]
 
-                            # L1 / L2
                             if "l1" in self.motion_loss_type:
                                 motion_losses.append(
                                     F.l1_loss(pred_motion_f, gt_motion_f, reduction="sum")
@@ -529,7 +566,6 @@ class YOLOXHead(nn.Module):
                                     F.mse_loss(pred_motion_f, gt_motion_f, reduction="sum")
                                 )
 
-                            # Cosine loss（prev+next モードのみ）
                             if (
                                 "cosine" in self.motion_loss_type
                                 and self.motion_branch_mode == "prev+next"
@@ -540,7 +576,8 @@ class YOLOXHead(nn.Module):
                                 p_next_n = F.normalize(pred_next, dim=-1, eps=1e-8)
                                 loss_cos = 1.0 - F.cosine_similarity(p_prev_n, p_next_n, dim=-1)
                                 motion_losses.append(loss_cos.sum())
-                        # --- ここまで ---
+
+                        
             
             # collect per-batch targets/masks
             cls_targets.append(cls_target)
