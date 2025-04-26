@@ -147,11 +147,10 @@ def draw_bboxes(img, boxes, labelmap=LABELMAP_GEN1) -> None:
         cv2.putText(img, class_name, (center[0], pt2[1] - 1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color)
         cv2.putText(img, str(score), (center[0], pt1[1] - 1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color)
 
-def draw_bboxes_with_id(img, boxes, dataset_name: str) -> None:
+def draw_bboxes_with_id(img, boxes, dataset_name: str, motion_branch_mode: str = None) -> np.ndarray:
     """
     画像 img にバウンディングボックスを描画する関数
     """
-    # カラーマップの生成（描画に使う色のリスト）
     colors = cv2.applyColorMap(np.arange(0, 255).astype(np.uint8), cv2.COLORMAP_HSV)
     colors = [tuple(*item) for item in colors.tolist()]
 
@@ -164,10 +163,8 @@ def draw_bboxes_with_id(img, boxes, dataset_name: str) -> None:
     if scale_multiplier != 1:
         img = cv2.resize(img, dim_new_wh, interpolation=cv2.INTER_AREA)
 
-    # boxes のフォーマットに応じた分岐
     num_elems = len(boxes[0])
     if num_elems == 5:
-        # (cls_id, cx, cy, w, h)
         for cls_id, cx, cy, w, h in boxes:
             score = 1.0
             pt1 = (int(cx - w / 2), int(cy - h / 2))
@@ -181,7 +178,6 @@ def draw_bboxes_with_id(img, boxes, dataset_name: str) -> None:
             img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
 
     elif num_elems == 7:
-        # (x1, y1, x2, y2, obj_conf, class_conf, class_id)
         for x1, y1, x2, y2, obj_conf, class_conf, class_id in boxes:
             score = obj_conf * class_conf
             bbox = tuple(int(x * scale_multiplier) for x in (x1, y1, x2, y2))
@@ -192,29 +188,58 @@ def draw_bboxes_with_id(img, boxes, dataset_name: str) -> None:
             img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
 
     elif num_elems == 9:
-        # (cls_id, cx, cy, w, h, prev_dx, prev_dy, next_dx, next_dy)
-        for cls_id, cx, cy, w, h, prev_dx, prev_dy, next_dx, next_dy in boxes:
-            score = 1.0
-            pt1 = (int(cx - w / 2), int(cy - h / 2))
-            pt2 = (int(cx + w / 2), int(cy + h / 2))
-            bbox = tuple(int(x * scale_multiplier) for x in (*pt1, *pt2))
-            cx_s, cy_s = int(cx * scale_multiplier), int(cy * scale_multiplier)
-            class_id = int(cls_id)
-            class_name = labelmap[class_id % len(labelmap)]
-            bbox_txt = f"{class_name} {score:.2f}" if add_score else class_name
-            color = classid2colors[class_id]
-            img = bbv.draw_rectangle(img, bbox, bbox_color=color)
-            img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
-            # prev (blue), next (red)
-            img = cv2.arrowedLine(img, (cx_s, cy_s),
-                                  (cx_s + int(prev_dx * scale_multiplier), cy_s + int(prev_dy * scale_multiplier)),
-                                  color=(255, 0, 0), thickness=2, tipLength=0.2)
-            img = cv2.arrowedLine(img, (cx_s, cy_s),
-                                  (cx_s + int(next_dx * scale_multiplier), cy_s + int(next_dy * scale_multiplier)),
-                                  color=(0, 0, 255), thickness=2, tipLength=0.2)
+        if motion_branch_mode == "prev+next":
+            # (cls_id, cx, cy, w, h, prev_dx, prev_dy, next_dx, next_dy)
+            for cls_id, cx, cy, w, h, prev_dx, prev_dy, next_dx, next_dy in boxes:
+                score = 1.0
+                pt1 = (int(cx - w / 2), int(cy - h / 2))
+                pt2 = (int(cx + w / 2), int(cy + h / 2))
+                bbox = tuple(int(x * scale_multiplier) for x in (*pt1, *pt2))
+                cx_s, cy_s = int(cx * scale_multiplier), int(cy * scale_multiplier)
+                class_id = int(cls_id)
+                class_name = labelmap[class_id % len(labelmap)]
+                bbox_txt = f"{class_name} {score:.2f}" if add_score else class_name
+                color = classid2colors[class_id]
+                img = bbv.draw_rectangle(img, bbox, bbox_color=color)
+                img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
+
+                img = cv2.arrowedLine(img, (cx_s, cy_s), (cx_s + int(prev_dx * scale_multiplier), cy_s + int(prev_dy * scale_multiplier)), color=(255, 0, 0), thickness=2, tipLength=0.2)
+                img = cv2.arrowedLine(img, (cx_s, cy_s), (cx_s + int(next_dx * scale_multiplier), cy_s + int(next_dy * scale_multiplier)), color=(0, 0, 255), thickness=2, tipLength=0.2)
+
+        elif motion_branch_mode == "prev":
+            # (x1, y1, x2, y2, obj_conf, class_conf, class_id, prev_x, prev_y)
+            for x1, y1, x2, y2, obj_conf, class_conf, class_id, prev_x, prev_y in boxes:
+                score = obj_conf * class_conf
+                bbox = tuple(int(x * scale_multiplier) for x in (x1, y1, x2, y2))
+                cx_s = int((x1 + x2) / 2 * scale_multiplier)
+                cy_s = int((y1 + y2) / 2 * scale_multiplier)
+                class_name = labelmap[int(class_id) % len(labelmap)]
+                bbox_txt = f"{class_name} {score:.2f}" if add_score else class_name
+                color = classid2colors[int(class_id)]
+                img = bbv.draw_rectangle(img, bbox, bbox_color=color)
+                img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
+
+                img = cv2.arrowedLine(img, (cx_s, cy_s), (cx_s + int(prev_x * scale_multiplier), cy_s + int(prev_y * scale_multiplier)), color=(255, 0, 0), thickness=2, tipLength=0.2)
+
+        elif motion_branch_mode == "next":
+            # (x1, y1, x2, y2, obj_conf, class_conf, class_id, next_x, next_y)
+            for x1, y1, x2, y2, obj_conf, class_conf, class_id, next_x, next_y in boxes:
+                score = obj_conf * class_conf
+                bbox = tuple(int(x * scale_multiplier) for x in (x1, y1, x2, y2))
+                cx_s = int((x1 + x2) / 2 * scale_multiplier)
+                cy_s = int((y1 + y2) / 2 * scale_multiplier)
+                class_name = labelmap[int(class_id) % len(labelmap)]
+                bbox_txt = f"{class_name} {score:.2f}" if add_score else class_name
+                color = classid2colors[int(class_id)]
+                img = bbv.draw_rectangle(img, bbox, bbox_color=color)
+                img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
+
+                img = cv2.arrowedLine(img, (cx_s, cy_s), (cx_s + int(next_x * scale_multiplier), cy_s + int(next_y * scale_multiplier)), color=(0, 0, 255), thickness=2, tipLength=0.2)
+
+        else:
+            raise ValueError(f"motion_branch_mode must be specified for 9 elements: got {motion_branch_mode}")
 
     elif num_elems == 11:
-        # (cls_id, cx, cy, w, h, dx, dy, prev_dx, prev_dy, next_dx, next_dy)
         for cls_id, cx, cy, w, h, dx, dy, prev_dx, prev_dy, next_dx, next_dy in boxes:
             score = 1.0
             pt1 = (int(cx - w / 2), int(cy - h / 2))
@@ -227,15 +252,9 @@ def draw_bboxes_with_id(img, boxes, dataset_name: str) -> None:
             color = classid2colors[class_id]
             img = bbv.draw_rectangle(img, bbox, bbox_color=color)
             img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
-            # current (green), prev (blue), next (red)
-            for vec, col in [
-                ((dx, dy), (0, 255, 0)),
-                ((prev_dx, prev_dy), (255, 0, 0)),
-                ((next_dx, next_dy), (0, 0, 255))
-            ]:
+            for vec, col in [((dx, dy), (0, 255, 0)), ((prev_dx, prev_dy), (255, 0, 0)), ((next_dx, next_dy), (0, 0, 255))]:
                 tip = (cx_s + int(vec[0] * scale_multiplier), cy_s + int(vec[1] * scale_multiplier))
-                img = cv2.arrowedLine(img, (cx_s, cy_s), tip,
-                                      color=col, thickness=2, tipLength=0.2)
+                img = cv2.arrowedLine(img, (cx_s, cy_s), tip, color=col, thickness=2, tipLength=0.2)
 
     else:
         raise ValueError(f"Invalid boxes format: got length {num_elems}")
@@ -245,7 +264,7 @@ def draw_bboxes_with_id(img, boxes, dataset_name: str) -> None:
 
 
 
-def visualize(video_writer: cv2.VideoWriter, ev_tensors: torch.Tensor, labels_yolox: torch.Tensor, pred_processed: torch.Tensor, dataset_name:str):
+def visualize(video_writer: cv2.VideoWriter, ev_tensors: torch.Tensor, labels_yolox: torch.Tensor, pred_processed: torch.Tensor, dataset_name: str, motion_branch_mode: str = None):
     img = ev_repr_to_img(ev_tensors.squeeze().cpu().numpy())
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     if labels_yolox is not None and labels_yolox[0] is not None:
@@ -254,9 +273,10 @@ def visualize(video_writer: cv2.VideoWriter, ev_tensors: torch.Tensor, labels_yo
 
     if pred_processed is not None and pred_processed[0] is not None:
         pred_processed = pred_processed[0].detach().cpu().numpy()
-        img = draw_bboxes_with_id(img, pred_processed, dataset_name)
+        img = draw_bboxes_with_id(img, pred_processed, dataset_name, motion_branch_mode=motion_branch_mode)
 
     video_writer.write(img)
+
 
 def create_video(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_path: str ,show_gt: bool, show_pred: bool, output_path: str, fps: int, num_sequence: int, dataset_mode: DatasetMode):  
 
@@ -353,7 +373,7 @@ def create_video(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_
                     pred_processed = postprocess_with_motion(prediction=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
 
             ## 可視化
-            visualize(video_writer, ev_tensors, labels_yolox, pred_processed, data.dataset_name)
+            visualize(video_writer, ev_tensors, labels_yolox, pred_processed, data.dataset_name, model.mdl_config.motion_branch_mode)
 
     print(f"Video saved at {output_path}")
     video_writer.release()
