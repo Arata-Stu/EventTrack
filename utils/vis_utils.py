@@ -373,7 +373,7 @@ def create_video(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_
                     pred_processed = postprocess_with_motion(prediction=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
 
             ## 可視化
-            visualize(video_writer, ev_tensors, labels_yolox, pred_processed, data.dataset_name, model.mdl_config.motion_branch_mode)
+            visualize(video_writer, ev_tensors, labels_yolox, pred_processed, data.dataset_name, model.mdl_config.head.motion_branch_mode)
 
     print(f"Video saved at {output_path}")
     video_writer.release()
