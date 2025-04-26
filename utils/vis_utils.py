@@ -253,12 +253,12 @@ def visualize(video_writer: cv2.VideoWriter, ev_tensors: torch.Tensor, labels_yo
         img = draw_bboxes_with_id(img, labels_yolox, dataset_name)
 
     if pred_processed is not None and pred_processed[0] is not None:
-        pred_processed = pred_processed[0].cpu().numpy()
+        pred_processed = pred_processed[0].detach().cpu().numpy()
         img = draw_bboxes_with_id(img, pred_processed, dataset_name)
 
     video_writer.write(img)
 
-def create_video(data: pl.LightningDataModule , model: pl.LightningModule, show_gt: bool, show_pred: bool, output_path: str, fps: int, num_sequence: int, dataset_mode: DatasetMode):  
+def create_video(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_path: str ,show_gt: bool, show_pred: bool, output_path: str, fps: int, num_sequence: int, dataset_mode: DatasetMode):  
 
     data_size =  dataset2size[data.dataset_name]
     ## yolox or track
@@ -296,9 +296,12 @@ def create_video(data: pl.LightningDataModule , model: pl.LightningModule, show_
         model.eval()
         model.to(device)  # モデルをデバイスに移動
         rnn_state = RNNStates()
-        prev_states = rnn_state.get_states(worker_id=0)
         size = model.in_res_hw
         input_padder = InputPadderFromShape(size)
+
+    if ckpt_path is not None:
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt['state_dict'])
 
     sequence_count = 0
     
@@ -309,6 +312,10 @@ def create_video(data: pl.LightningDataModule , model: pl.LightningModule, show_
         ev_repr = data_batch[DataType.EV_REPR]
         labels = data_batch[DataType.OBJLABELS_SEQ]
         is_first_sample = data_batch[DataType.IS_FIRST_SAMPLE]
+
+        if show_pred:
+            rnn_state.reset(worker_id=0, indices_or_bool_tensor=is_first_sample)
+            prev_states = rnn_state.get_states(worker_id=0)
 
         if is_first_sample.any():
             sequence_count += 1

@@ -1,5 +1,4 @@
 defaults:
-  # - general
   - model: ???   
   - dataset: ???  
   - _self_
@@ -18,6 +17,7 @@ pred: False
 fps: 10
 num_sequence: 1
 dataset_mode: test
+ckpt_path: null
 
 hydra:
   run:

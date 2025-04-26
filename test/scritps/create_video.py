@@ -1,6 +1,7 @@
 import sys
 sys.path.append('../..')
 
+import os
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
@@ -22,14 +23,19 @@ def main(cfg: DictConfig):
     fps = cfg.fps
     num_sequence = cfg.num_sequence
     dataset_mode = cfg.dataset_mode
+    ckpt_path = cfg.ckpt_path
+
+    dir_name = os.path.dirname(output_path)
+    if dir_name and not os.path.exists(dir_name):
+        os.makedirs(dir_name, exist_ok=True)
 
     ## データセットの読み込み
     data = fetch_data_module(config=cfg)
     ## モデルの読み込み
-    model = fetch_model_module(config=cfg)
-
+    module = fetch_model_module(config=cfg)
+        
     ##ビデオの作成
-    create_video(data, model, show_gt, show_pred, output_path, fps, num_sequence, dataset_mode)
+    create_video(data, module, ckpt_path, show_gt, show_pred, output_path, fps, num_sequence, dataset_mode)
 
 if __name__ == '__main__':
     main()
