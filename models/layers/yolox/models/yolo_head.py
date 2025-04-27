@@ -414,239 +414,164 @@ class YOLOXHead(nn.Module):
         origin_preds,
         dtype,
     ):
-        bbox_preds = outputs[:, :, :4]  # [batch, n_anchors_all, 4]
-        obj_preds  = outputs[:, :, 4:5]  # [batch, n_anchors_all, 1]
-        cls_preds  = outputs[:, :, 5:5 + self.num_classes]  # [batch, n_anchors_all, n_cls]
-        motion_preds = outputs[:, :, 5 + self.num_classes:]  # [batch, n_anchors_all, motion_dim]
+        """
+        Args:
+          x_shifts, y_shifts: 各スケールのグリッド座標 (list of Tensor)
+          expanded_strides: 各スケールの stride (list of Tensor)
+          labels: (B, M, 1+4+motion_dim) の GT ラベル
+          outputs: (B, N, 5+num_classes+motion_dim) の生出力
+          origin_preds: L1 再構築用予備出力
+          dtype: 入力特徴量の dtype
+        Returns:
+          loss, iou_loss, obj_loss, cls_loss, l1_loss, num_fg/num_gt, motion_loss
+        """
+        batch_size = outputs.shape[0]
+        num_anchors = outputs.shape[1]
 
-        nlabel = (labels.sum(dim=2) > 0).sum(dim=1)  # 画像ごとの GT 数
-        total_num_anchors = outputs.shape[1]
+        # 切り出し
+        bbox_preds   = outputs[:, :, :4]
+        obj_preds    = outputs[:, :, 4:5]
+        cls_preds    = outputs[:, :, 5:5 + self.num_classes]
+        motion_preds = outputs[:, :, 5 + self.num_classes:]
 
+        # グリッド・stride の concat
         x_shifts = torch.cat(x_shifts, 1)
         y_shifts = torch.cat(y_shifts, 1)
         expanded_strides = torch.cat(expanded_strides, 1)
         if self.use_l1:
             origin_preds = torch.cat(origin_preds, 1)
 
-        cls_targets  = []
-        reg_targets  = []
-        l1_targets   = []
-        obj_targets  = []
-        fg_masks     = []
+        cls_targets = []
+        reg_targets = []
+        obj_targets = []
+        fg_masks    = []
         motion_losses = []
-
-        num_fg  = 0.0
+        num_fg = 0.0
         num_gts = 0.0
 
-        for batch_idx in range(outputs.shape[0]):
-            num_gt = int(nlabel[batch_idx])
-            num_gts += num_gt
+        for i in range(batch_size):
+            # GT 数
+            nlabel = (labels[i].sum(dim=1) > 0).sum().item()
+            num_gts += nlabel
 
-            if num_gt == 0:
-                # GT がない場合はダミーを用意
-                cls_target = outputs.new_zeros((0, self.num_classes))
-                reg_target = outputs.new_zeros((0, 4))
-                l1_target  = outputs.new_zeros((0, 4))
-                obj_target = outputs.new_zeros((total_num_anchors, 1))
-                fg_mask    = outputs.new_zeros(total_num_anchors).bool()
-            else:
-                # GT ボックス・クラス
-                gt_bboxes_per_image = labels[batch_idx, :num_gt, 1:5]
-                gt_classes = labels[batch_idx, :num_gt, 0]
-                bboxes_preds_per_image = bbox_preds[batch_idx]
+            if nlabel == 0:
+                fg_masks.append(outputs.new_zeros(num_anchors).bool())
+                cls_targets.append(outputs.new_zeros((0, self.num_classes)))
+                reg_targets.append(outputs.new_zeros((0, 4)))
+                obj_targets.append(outputs.new_zeros((num_anchors, 1)))
+                continue
 
-                (
-                    gt_matched_classes,
-                    fg_mask,
-                    pred_ious_this_matching,
-                    matched_gt_inds,
-                    num_fg_img,
-                ) = self.get_assignments(
-                    batch_idx,
-                    num_gt,
-                    gt_bboxes_per_image,
-                    gt_classes,
-                    bboxes_preds_per_image,
-                    expanded_strides,
-                    x_shifts,
-                    y_shifts,
-                    cls_preds,
-                    obj_preds,
-                )
+            # GT 抽出
+            gt_boxes   = labels[i, :nlabel, 1:5]
+            gt_classes = labels[i, :nlabel, 0].long()
 
-                num_fg += num_fg_img
+            # SimOTA で正例アンカー割当
+            (gt_cls, fg_mask, pred_ious, matched_inds, nf) = self.get_assignments(
+                i, nlabel, gt_boxes, gt_classes,
+                bbox_preds[i], expanded_strides, x_shifts, y_shifts,
+                cls_preds, obj_preds
+            )
+            num_fg += nf
 
-                # classification, objectness, regression targets
-                cls_target = (
-                    F.one_hot(gt_matched_classes.to(torch.int64), self.num_classes)
-                    * pred_ious_this_matching.unsqueeze(-1)
-                )
-                obj_target = fg_mask.unsqueeze(-1)
-                reg_target = gt_bboxes_per_image[matched_gt_inds]
-                if self.use_l1:
-                    l1_target = self.get_l1_target(
-                        outputs.new_zeros((num_fg_img, 4)),
-                        gt_bboxes_per_image[matched_gt_inds],
-                        expanded_strides[0][fg_mask],
-                        x_shifts=x_shifts[0][fg_mask],
-                        y_shifts=y_shifts[0][fg_mask],
-                    )
-
-                # --- motion loss ---
-                if self.motion_loss_type != "none" and motion_preds is not None:
-                    pred_motion = motion_preds[batch_idx][fg_mask]  # [num_fg_img, motion_dim]
-
-                    # GT motion 抽出
-                    if self.motion_branch_mode == "prev+next":
-                        gt_prev = labels[batch_idx, matched_gt_inds, 5:7]
-                        gt_next = labels[batch_idx, matched_gt_inds, 7:9]
-                        gt_motion = torch.cat([gt_prev, gt_next], dim=1)
-                    elif self.motion_branch_mode == "prev":
-                        gt_motion = labels[batch_idx, matched_gt_inds, 5:7]
-                    elif self.motion_branch_mode == "next":
-                        gt_motion = labels[batch_idx, matched_gt_inds, 7:9]
-                    else:
-                        gt_motion = None
-
-                    # 有効性チェック
-                    if (
-                        gt_motion is not None
-                        and gt_motion.numel() > 0
-                        and gt_motion.shape[-1] == pred_motion.shape[-1]
-                    ):
-                        # --- 改訂版: 信頼できる motion のみ使用 ---
-                        if self.motion_branch_mode == "prev+next":
-                            gt_dx_prev, gt_dy_prev = gt_motion[:, 0], gt_motion[:, 1]
-                            gt_dx_next, gt_dy_next = gt_motion[:, 2], gt_motion[:, 3]
-                            mag_prev = torch.norm(gt_motion[:, :2], dim=1)
-                            mag_next = torch.norm(gt_motion[:, 2:4], dim=1)
-
-                            # 非対称性チェック
-                            eps = 1e-6
-                            ratio_prev = torch.maximum(
-                                torch.abs(gt_dx_prev) / (torch.abs(gt_dy_prev) + eps),
-                                torch.abs(gt_dy_prev) / (torch.abs(gt_dx_prev) + eps)
-                            )
-                            ratio_next = torch.maximum(
-                                torch.abs(gt_dx_next) / (torch.abs(gt_dy_next) + eps),
-                                torch.abs(gt_dy_next) / (torch.abs(gt_dx_next) + eps)
-                            )
-
-                            # 各条件のマスク
-                            mask_prev = (
-                                (mag_prev <= 20.0)
-                                & (ratio_prev <= 10.0)
-                                & (torch.abs(gt_dx_prev) <= 30.0)
-                                & (torch.abs(gt_dy_prev) <= 30.0)
-                            )
-                            mask_next = (
-                                (mag_next <= 20.0)
-                                & (ratio_next <= 10.0)
-                                & (torch.abs(gt_dx_next) <= 30.0)
-                                & (torch.abs(gt_dy_next) <= 30.0)
-                            )
-
-                            reliable_mask = mask_prev & mask_next
-
-                        else:
-                            # 単独の prev or next モード
-                            gt_dx, gt_dy = gt_motion[:, 0], gt_motion[:, 1]
-                            mag = torch.norm(gt_motion, dim=1)
-                            ratio = torch.maximum(
-                                torch.abs(gt_dx) / (torch.abs(gt_dy) + 1e-6),
-                                torch.abs(gt_dy) / (torch.abs(gt_dx) + 1e-6)
-                            )
-                            reliable_mask = (
-                                (mag <= 20.0)
-                                & (ratio <= 10.0)
-                                & (torch.abs(gt_dx) <= 30.0)
-                                & (torch.abs(gt_dy) <= 30.0)
-                            )
-
-                        if reliable_mask.sum() > 0:
-                            pred_motion_f = pred_motion[reliable_mask]
-                            gt_motion_f   = gt_motion[reliable_mask]
-
-                            if "l1" in self.motion_loss_type:
-                                motion_losses.append(
-                                    F.l1_loss(pred_motion_f, gt_motion_f, reduction="sum")
-                                )
-                            elif "l2" in self.motion_loss_type:
-                                motion_losses.append(
-                                    F.mse_loss(pred_motion_f, gt_motion_f, reduction="sum")
-                                )
-
-                            if (
-                                "cosine" in self.motion_loss_type
-                                and self.motion_branch_mode == "prev+next"
-                            ):
-                                pred_prev = pred_motion_f[:, :2]
-                                pred_next = pred_motion_f[:, 2:4]
-                                p_prev_n = F.normalize(pred_prev, dim=-1, eps=1e-8)
-                                p_next_n = F.normalize(pred_next, dim=-1, eps=1e-8)
-                                loss_cos = 1.0 - F.cosine_similarity(p_prev_n, p_next_n, dim=-1)
-                                motion_losses.append(loss_cos.sum())
-
-                        
-            
-            # collect per-batch targets/masks
-            cls_targets.append(cls_target)
-            reg_targets.append(reg_target)
-            obj_targets.append(obj_target.to(dtype))
+            # ターゲット生成
+            cls_targets.append(
+                F.one_hot(gt_cls, self.num_classes).float() * pred_ious.unsqueeze(-1)
+            )
+            reg_targets.append(gt_boxes[matched_inds])
+            obj_targets.append(fg_mask.unsqueeze(-1).float())
             fg_masks.append(fg_mask)
-            if self.use_l1:
-                l1_targets.append(l1_target)
+            
+            # --- motion loss (CenterTrack + velocity‐filter) ---
+            if self.motion_preds is not None and "none" not in self.motion_loss_type:
+                # GT motion を抽出
+                if self.motion_branch_mode == "prev+next":
+                    gt_prev = labels[i, matched_inds, 5:7]
+                    gt_next = labels[i, matched_inds, 7:9]
+                    gt_motion = torch.cat([gt_prev, gt_next], dim=1)
+                    # velocity の信頼性マスク
+                    mag_prev = torch.norm(gt_prev, dim=1)
+                    mag_next = torch.norm(gt_next, dim=1)
+                    eps = 1e-6
+                    ratio_prev = torch.maximum(gt_prev.abs()[:,0]/(gt_prev.abs()[:,1]+eps),
+                                            gt_prev.abs()[:,1]/(gt_prev.abs()[:,0]+eps))
+                    ratio_next = torch.maximum(gt_next.abs()[:,0]/(gt_next.abs()[:,1]+eps),
+                                            gt_next.abs()[:,1]/(gt_next.abs()[:,0]+eps))
+                    mask_prev = (mag_prev<=20.0)&(ratio_prev<=10.0)&(gt_prev.abs()[:,0]<=30)&(gt_prev.abs()[:,1]<=30)
+                    mask_next = (mag_next<=20.0)&(ratio_next<=10.0)&(gt_next.abs()[:,0]<=30)&(gt_next.abs()[:,1]<=30)
+                    reliable_mask = mask_prev & mask_next
+                else:
+                    # 単一モード(prev or next) の場合
+                    gt_motion = labels[i, matched_inds, 5:7] if self.motion_branch_mode=="prev" \
+                                else labels[i, matched_inds, 7:9]
+                    mag = torch.norm(gt_motion, dim=1)
+                    ratio = torch.maximum(gt_motion.abs()[:,0]/(gt_motion.abs()[:,1]+1e-6),
+                                        gt_motion.abs()[:,1]/(gt_motion.abs()[:,0]+1e-6))
+                    reliable_mask = (mag<=20.0)&(ratio<=10.0)&(gt_motion.abs()[:,0]<=30)&(gt_motion.abs()[:,1]<=30)
 
-        # バッチ全体をまとめて損失計算
-        cls_targets = torch.cat(cls_targets, 0)
-        reg_targets = torch.cat(reg_targets, 0)
-        obj_targets = torch.cat(obj_targets, 0)
-        fg_masks    = torch.cat(fg_masks, 0)
-        if self.use_l1:
-            l1_targets = torch.cat(l1_targets, 0)
+                # SimOTA で選ばれた fg_mask と組み合わせ
+                mask = fg_mask & reliable_mask
+                if mask.sum() > 0:
+                    pm = motion_preds[i][mask]  # [有効数, motion_dim]
+                    gm = gt_motion[mask]
+                    m = mask.sum().float()
 
-        num_fg = max(num_fg, 1)
-        loss_iou = (
-            self.iou_loss(bbox_preds.view(-1, 4)[fg_masks], reg_targets).sum()
-            / num_fg
-        )
-        loss_obj = (
-            self.bcewithlog_loss(obj_preds.view(-1, 1), obj_targets).sum()
-            / num_fg
-        )
-        loss_cls = (
-            self.bcewithlog_loss(
-                cls_preds.view(-1, self.num_classes)[fg_masks], cls_targets
-            ).sum()
-            / num_fg
-        )
+                    # L1 or L2
+                    if "l1" in self.motion_loss_type:
+                        ml = F.l1_loss(pm, gm, reduction="sum") / m
+                    elif "l2" in self.motion_loss_type:
+                        ml = F.mse_loss(pm, gm, reduction="sum") / m
+                    else:
+                        ml = outputs.new_tensor(0.0)
+
+                    # Cosine 整合性
+                    if "cosine" in self.motion_loss_type and self.motion_branch_mode=="prev+next":
+                        p_prev = pm[:, :2]; p_next = pm[:, 2:4]
+                        p_prev_n = F.normalize(p_prev, dim=-1, eps=1e-8)
+                        p_next_n = F.normalize(p_next, dim=-1, eps=1e-8)
+                        cos_term = (1 - F.cosine_similarity(p_prev_n, p_next_n, dim=-1)).sum() / m
+                        ml = ml + cos_term
+
+                    motion_losses.append(ml)        
+
+
+        # 全体損失計算
+        num_fg = max(num_fg, 1.0)
+        fg_all = torch.cat(fg_masks, 0)
+        # IoU
+        loss_iou = self.iou_loss(
+            bbox_preds.view(-1,4)[fg_all], torch.cat(reg_targets,0)
+        ).sum() / num_fg
+        # Obj
+        loss_obj = self.bcewithlog_loss(
+            obj_preds.view(-1,1), torch.cat(obj_targets,0)
+        ).sum() / num_fg
+        # Cls
+        loss_cls = self.bcewithlog_loss(
+            cls_preds.view(-1,self.num_classes)[fg_all], torch.cat(cls_targets,0)
+        ).sum() / num_fg
+        # L1
         loss_l1 = (
-            self.l1_loss(origin_preds.view(-1, 4)[fg_masks], l1_targets).sum()
-            / num_fg
-            if self.use_l1
-            else 0.0
+            self.l1_loss(
+                origin_preds.view(-1,4)[fg_all], torch.cat(reg_targets,0)
+            ).sum() / num_fg
+            if self.use_l1 else 0.0
         )
-
+        # Motion
         loss_motion = sum(motion_losses) / num_fg if motion_losses else 0.0
 
-        reg_weight = 5.0
-        loss = (
-            reg_weight * loss_iou
-            + loss_obj
-            + loss_cls
-            + loss_l1
-            + loss_motion
-        )
+        total_loss = 5.0 * loss_iou + loss_obj + loss_cls + loss_l1 + loss_motion
 
         return (
-            loss,
-            reg_weight * loss_iou,
+            total_loss,
+            loss_iou * 5.0,
             loss_obj,
             loss_cls,
             loss_l1,
-            num_fg / max(num_gts, 1),
-            loss_motion,
+            num_fg/max(num_gts,1),
+            loss_motion
         )
+
+
 
 
 
