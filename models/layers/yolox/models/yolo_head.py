@@ -181,15 +181,25 @@ class YOLOXHead(nn.Module):
                 print("Could not compile YOLOXHead because torch.compile is not available")
 
     def initialize_biases(self, prior_prob):
+        # Classification の bias
         for conv in self.cls_preds:
             b = conv.bias.view(1, -1)
             b.data.fill_(-math.log((1 - prior_prob) / prior_prob))
-            conv.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+            conv.bias = nn.Parameter(b.view(-1), requires_grad=True)
 
+        # Objectness の bias
         for conv in self.obj_preds:
             b = conv.bias.view(1, -1)
             b.data.fill_(-math.log((1 - prior_prob) / prior_prob))
-            conv.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+            conv.bias = nn.Parameter(b.view(-1), requires_grad=True)
+
+        # Motion branch の bias も同様に prior_prob ベースで初期化
+        if self.motion_preds is not None:
+            for conv in self.motion_preds:
+                b = conv.bias.view(1, -1)
+                b.data.fill_(-math.log((1 - prior_prob) / prior_prob))
+                conv.bias = nn.Parameter(b.view(-1), requires_grad=True)
+
 
 
     def forward(self, xin, labels=None):
