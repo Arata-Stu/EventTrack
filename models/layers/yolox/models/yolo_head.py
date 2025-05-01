@@ -509,7 +509,11 @@ class YOLOXHead(nn.Module):
                     reliable_mask = (mag<=20.0)&(ratio<=10.0)&(gt_motion.abs()[:,0]<=30)&(gt_motion.abs()[:,1]<=30)
 
                 # SimOTA で選ばれた fg_mask と組み合わせ
-                mask = fg_mask & reliable_mask
+                fg_inds = fg_mask.nonzero(as_tuple=False).squeeze(1)
+                scatter_mask = fg_mask.new_zeros(fg_mask.shape, dtype=torch.bool)
+                scatter_mask[fg_inds] = reliable_mask
+                mask = fg_mask & scatter_mask  # ← 修正後の行
+                # mask = fg_mask & reliable_mask
                 if mask.sum() > 0:
                     pm = motion_preds[i][mask]  # [有効数, motion_dim]
                     gm = gt_motion[mask]
