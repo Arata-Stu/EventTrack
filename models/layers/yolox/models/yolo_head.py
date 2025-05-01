@@ -480,7 +480,7 @@ class YOLOXHead(nn.Module):
             reg_targets.append(gt_boxes[matched_inds])
             obj_targets.append(fg_mask.unsqueeze(-1).float())
             fg_masks.append(fg_mask)
-            
+
             # --- motion loss (CenterTrack + velocity‐filter) ---
             if self.motion_preds is not None and "none" not in self.motion_loss_type:
                 # GT motion を抽出
@@ -488,38 +488,38 @@ class YOLOXHead(nn.Module):
                     gt_prev = labels[i, matched_inds, 5:7]
                     gt_next = labels[i, matched_inds, 7:9]
                     gt_motion = torch.cat([gt_prev, gt_next], dim=1)
-                    # velocity の信頼性マスク
-                    mag_prev = torch.norm(gt_prev, dim=1)
-                    mag_next = torch.norm(gt_next, dim=1)
+                else:
+                    gt_motion = (
+                        labels[i, matched_inds, 5:7]
+                        if self.motion_branch_mode == "prev"
+                        else labels[i, matched_inds, 7:9]
+                    )
+
+                # 信頼性マスク算出
+                if self.motion_branch_mode == "prev+next":
+                    mag_prev = torch.norm(gt_motion[:, :2], dim=1)
+                    mag_next = torch.norm(gt_motion[:, 2:4], dim=1)
                     eps = 1e-6
-                    ratio_prev = torch.maximum(gt_prev.abs()[:,0]/(gt_prev.abs()[:,1]+eps),
-                                            gt_prev.abs()[:,1]/(gt_prev.abs()[:,0]+eps))
-                    ratio_next = torch.maximum(gt_next.abs()[:,0]/(gt_next.abs()[:,1]+eps),
-                                            gt_next.abs()[:,1]/(gt_next.abs()[:,0]+eps))
-                    mask_prev = (mag_prev<=20.0)&(ratio_prev<=10.0)&(gt_prev.abs()[:,0]<=30)&(gt_prev.abs()[:,1]<=30)
-                    mask_next = (mag_next<=20.0)&(ratio_next<=10.0)&(gt_next.abs()[:,0]<=30)&(gt_next.abs()[:,1]<=30)
+                    dxp, dyp, dxn, dyn = gt_motion[:,0], gt_motion[:,1], gt_motion[:,2], gt_motion[:,3]
+                    ratio_prev = torch.maximum(torch.abs(dxp)/(torch.abs(dyp)+eps), torch.abs(dyp)/(torch.abs(dxp)+eps))
+                    ratio_next = torch.maximum(torch.abs(dxn)/(torch.abs(dyn)+eps), torch.abs(dyn)/(torch.abs(dxn)+eps))
+                    mask_prev = (mag_prev<=20.0)&(ratio_prev<=10.0)&(torch.abs(dxp)<=30.0)&(torch.abs(dyp)<=30.0)
+                    mask_next = (mag_next<=20.0)&(ratio_next<=10.0)&(torch.abs(dxn)<=30.0)&(torch.abs(dyn)<=30.0)
                     reliable_mask = mask_prev & mask_next
                 else:
-                    # 単一モード(prev or next) の場合
-                    gt_motion = labels[i, matched_inds, 5:7] if self.motion_branch_mode=="prev" \
-                                else labels[i, matched_inds, 7:9]
                     mag = torch.norm(gt_motion, dim=1)
-                    ratio = torch.maximum(gt_motion.abs()[:,0]/(gt_motion.abs()[:,1]+1e-6),
-                                        gt_motion.abs()[:,1]/(gt_motion.abs()[:,0]+1e-6))
-                    reliable_mask = (mag<=20.0)&(ratio<=10.0)&(gt_motion.abs()[:,0]<=30)&(gt_motion.abs()[:,1]<=30)
+                    dx, dy = gt_motion[:,0], gt_motion[:,1]
+                    ratio = torch.maximum(torch.abs(dx)/(torch.abs(dy)+1e-6), torch.abs(dy)/(torch.abs(dx)+1e-6))
+                    reliable_mask = (mag<=20.0)&(ratio<=10.0)&(torch.abs(dx)<=30.0)&(torch.abs(dy)<=30.0)
 
-                # SimOTA で選ばれた fg_mask と組み合わせ
-                fg_inds = fg_mask.nonzero(as_tuple=False).squeeze(1)
-                scatter_mask = fg_mask.new_zeros(fg_mask.shape, dtype=torch.bool)
-                scatter_mask[fg_inds] = reliable_mask
-                mask = fg_mask & scatter_mask  # ← 修正後の行
-                # mask = fg_mask & reliable_mask
-                if mask.sum() > 0:
-                    pm = motion_preds[i][mask]  # [有効数, motion_dim]
-                    gm = gt_motion[mask]
-                    m = mask.sum().float()
+                # --- 予測を fg_mask で抽出 → matched_inds ベースの reliable_mask でフィルタ ---
+                pred_motion = motion_preds[i][fg_mask]  # [num_fg, motion_dim]
+                if reliable_mask.sum() > 0:
+                    pm = pred_motion[reliable_mask]      # [k, motion_dim]
+                    gm = gt_motion[reliable_mask]        # [k, motion_dim]
+                    m = reliable_mask.sum().float()
 
-                    # L1 or L2
+                    # 損失計算
                     if "l1" in self.motion_loss_type:
                         ml = F.smooth_l1_loss(pm, gm, reduction="sum", beta=1.0) / m
                     elif "l2" in self.motion_loss_type:
@@ -528,52 +528,38 @@ class YOLOXHead(nn.Module):
                         ml = outputs.new_tensor(0.0)
 
                     # Cosine 整合性
-                    if "cosine" in self.motion_loss_type and self.motion_branch_mode=="prev+next":
-                        p_prev = pm[:, :2]; p_next = pm[:, 2:4]
+                    if "cosine" in self.motion_loss_type and self.motion_branch_mode == "prev+next":
+                        p_prev, p_next = pm[:, :2], pm[:, 2:4]
                         p_prev_n = F.normalize(p_prev, dim=-1, eps=1e-8)
                         p_next_n = F.normalize(p_next, dim=-1, eps=1e-8)
                         cos_term = (1 - F.cosine_similarity(p_prev_n, p_next_n, dim=-1)).sum() / m
                         ml = ml + cos_term
 
-                    motion_losses.append(ml)        
-
+                    motion_losses.append(ml)
 
         # 全体損失計算
         num_fg = max(num_fg, 1.0)
         fg_all = torch.cat(fg_masks, 0)
-        # IoU
-        loss_iou = self.iou_loss(
-            bbox_preds.view(-1,4)[fg_all], torch.cat(reg_targets,0)
-        ).sum() / num_fg
-        # Obj
-        loss_obj = self.bcewithlog_loss(
-            obj_preds.view(-1,1), torch.cat(obj_targets,0)
-        ).sum() / num_fg
-        # Cls
-        loss_cls = self.bcewithlog_loss(
-            cls_preds.view(-1,self.num_classes)[fg_all], torch.cat(cls_targets,0)
-        ).sum() / num_fg
-        # L1
+        loss_iou = self.iou_loss(bbox_preds.view(-1,4)[fg_all], torch.cat(reg_targets,0)).sum() / num_fg
+        loss_obj = self.bcewithlog_loss(obj_preds.view(-1,1), torch.cat(obj_targets,0)).sum() / num_fg
+        loss_cls = self.bcewithlog_loss(cls_preds.view(-1,self.num_classes)[fg_all], torch.cat(cls_targets,0)).sum() / num_fg
         loss_l1 = (
-            self.l1_loss(
-                origin_preds.view(-1,4)[fg_all], torch.cat(reg_targets,0)
-            ).sum() / num_fg
+            self.l1_loss(origin_preds.view(-1,4)[fg_all], torch.cat(reg_targets,0)).sum() / num_fg
             if self.use_l1 else 0.0
         )
-        # Motion
         loss_motion = sum(motion_losses) / num_fg if motion_losses else 0.0
 
         total_loss = 5.0 * loss_iou + loss_obj + loss_cls + loss_l1 + loss_motion
-
         return (
             total_loss,
             loss_iou * 5.0,
             loss_obj,
             loss_cls,
             loss_l1,
-            num_fg/max(num_gts,1),
-            loss_motion
+            num_fg / max(num_gts,1),
+            loss_motion,
         )
+
 
 
 
