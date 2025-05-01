@@ -164,7 +164,7 @@ class YOLOXHead(nn.Module):
 
         # --- Loss 定義など ---
         self.use_l1 = False
-        self.l1_loss = nn.L1Loss(reduction="none")
+        self.l1_loss = nn.SmoothL1Loss(reduction="none", beta=1.0)  # beta は Huber のしきい値
         self.bcewithlog_loss = nn.BCEWithLogitsLoss(reduction="none")
         self.iou_loss = IOUloss(reduction="none")
         self.strides = strides
@@ -517,7 +517,7 @@ class YOLOXHead(nn.Module):
 
                     # L1 or L2
                     if "l1" in self.motion_loss_type:
-                        ml = F.l1_loss(pm, gm, reduction="sum") / m
+                        ml = F.smooth_l1_loss(pm, gm, reduction="sum", beta=1.0) / m
                     elif "l2" in self.motion_loss_type:
                         ml = F.mse_loss(pm, gm, reduction="sum") / m
                     else:
