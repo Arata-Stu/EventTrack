@@ -521,7 +521,7 @@ class YOLOXHead(nn.Module):
 
                     # 損失計算
                     if "l1" in self.motion_loss_type:
-                        ml = F.smooth_l1_loss(pm, gm, reduction="sum", beta=1.0) / m
+                        ml = F.smooth_l1_loss(pm, gm, reduction="sum", beta=0.5) / m
                     elif "l2" in self.motion_loss_type:
                         ml = F.mse_loss(pm, gm, reduction="sum") / m
                     else:
