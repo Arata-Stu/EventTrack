@@ -147,10 +147,29 @@ def draw_bboxes(img, boxes, labelmap=LABELMAP_GEN1) -> None:
         cv2.putText(img, class_name, (center[0], pt2[1] - 1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color)
         cv2.putText(img, str(score), (center[0], pt1[1] - 1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color)
 
-def draw_bboxes_with_id(img, boxes, dataset_name: str, motion_branch_mode: str = None) -> np.ndarray:
+def draw_bboxes_with_id(
+    img: np.ndarray,
+    boxes: np.ndarray,
+    dataset_name: str,
+    motion_branch_mode: str = None,
+    motion_scale: float = 5.0,
+    arrow_thickness: int = 3,
+    arrow_tip_length: float = 0.3
+) -> np.ndarray:
     """
-    画像 img にバウンディングボックスを描画する関数
+    画像 img にバウンディングボックスと動きベクトルを描画する関数
+    Args:
+        img: 入力画像 (H x W x 3)
+        boxes: バウンディングボックス情報の numpy 配列
+        dataset_name: データセット名(gen1/gen4/VGA)
+        motion_branch_mode: モーションブランチのモード('prev+next','prev','next')
+        motion_scale: ベクトルを拡大するスケールファクタ
+        arrow_thickness: 矢印の線幅
+        arrow_tip_length: 矢印先端の大きさ
+    Returns:
+        描画後の画像
     """
+    # カラーマップを用意
     colors = cv2.applyColorMap(np.arange(0, 255).astype(np.uint8), cv2.COLORMAP_HSV)
     colors = [tuple(*item) for item in colors.tolist()]
 
@@ -163,20 +182,23 @@ def draw_bboxes_with_id(img, boxes, dataset_name: str, motion_branch_mode: str =
     if scale_multiplier != 1:
         img = cv2.resize(img, dim_new_wh, interpolation=cv2.INTER_AREA)
 
-    num_elems = len(boxes[0])
+    # boxes の要素数によって描画形式を切り替え
+    num_elems = len(boxes[0]) if len(boxes.shape) > 1 else len(boxes)
+
+    # --- 5要素形式 ---
     if num_elems == 5:
         for cls_id, cx, cy, w, h in boxes:
             score = 1.0
             pt1 = (int(cx - w / 2), int(cy - h / 2))
             pt2 = (int(cx + w / 2), int(cy + h / 2))
             bbox = tuple(int(x * scale_multiplier) for x in (*pt1, *pt2))
-            class_id = int(cls_id)
-            class_name = labelmap[class_id % len(labelmap)]
+            class_name = labelmap[int(cls_id) % len(labelmap)]
             bbox_txt = f"{class_name} {score:.2f}" if add_score else class_name
-            color = classid2colors[class_id]
+            color = classid2colors[int(cls_id)]
             img = bbv.draw_rectangle(img, bbox, bbox_color=color)
             img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
 
+    # --- 7要素形式 ---
     elif num_elems == 7:
         for x1, y1, x2, y2, obj_conf, class_conf, class_id in boxes:
             score = obj_conf * class_conf
@@ -187,27 +209,33 @@ def draw_bboxes_with_id(img, boxes, dataset_name: str, motion_branch_mode: str =
             img = bbv.draw_rectangle(img, bbox, bbox_color=color)
             img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
 
+    # --- 9要素形式 (prev+next) ---
     elif num_elems == 9:
         if motion_branch_mode == "prev+next":
-            # (cls_id, cx, cy, w, h, prev_dx, prev_dy, next_dx, next_dy)
             for cls_id, cx, cy, w, h, prev_dx, prev_dy, next_dx, next_dy in boxes:
                 score = 1.0
                 pt1 = (int(cx - w / 2), int(cy - h / 2))
                 pt2 = (int(cx + w / 2), int(cy + h / 2))
                 bbox = tuple(int(x * scale_multiplier) for x in (*pt1, *pt2))
                 cx_s, cy_s = int(cx * scale_multiplier), int(cy * scale_multiplier)
-                class_id = int(cls_id)
-                class_name = labelmap[class_id % len(labelmap)]
+                class_name = labelmap[int(cls_id) % len(labelmap)]
                 bbox_txt = f"{class_name} {score:.2f}" if add_score else class_name
-                color = classid2colors[class_id]
+                color = classid2colors[int(cls_id)]
                 img = bbv.draw_rectangle(img, bbox, bbox_color=color)
                 img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
 
-                img = cv2.arrowedLine(img, (cx_s, cy_s), (cx_s + int(prev_dx * scale_multiplier), cy_s + int(prev_dy * scale_multiplier)), color=(255, 0, 0), thickness=2, tipLength=0.2)
-                img = cv2.arrowedLine(img, (cx_s, cy_s), (cx_s + int(next_dx * scale_multiplier), cy_s + int(next_dy * scale_multiplier)), color=(0, 0, 255), thickness=2, tipLength=0.2)
+                # 矢印描画 (prev, next)
+                for vec, col in [((prev_dx, prev_dy), (255, 0, 0)), ((next_dx, next_dy), (0, 0, 255))]:
+                    vx, vy = vec
+                    tip = (cx_s + int(vx * motion_scale), cy_s + int(vy * motion_scale))
+                    img = cv2.arrowedLine(
+                        img, (cx_s, cy_s), tip,
+                        color=col,
+                        thickness=arrow_thickness,
+                        tipLength=arrow_tip_length
+                    )
 
         elif motion_branch_mode == "prev":
-            # (x1, y1, x2, y2, obj_conf, class_conf, class_id, prev_x, prev_y)
             for x1, y1, x2, y2, obj_conf, class_conf, class_id, prev_x, prev_y in boxes:
                 score = obj_conf * class_conf
                 bbox = tuple(int(x * scale_multiplier) for x in (x1, y1, x2, y2))
@@ -219,10 +247,15 @@ def draw_bboxes_with_id(img, boxes, dataset_name: str, motion_branch_mode: str =
                 img = bbv.draw_rectangle(img, bbox, bbox_color=color)
                 img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
 
-                img = cv2.arrowedLine(img, (cx_s, cy_s), (cx_s + int(prev_x * scale_multiplier), cy_s + int(prev_y * scale_multiplier)), color=(255, 0, 0), thickness=2, tipLength=0.2)
+                tip = (cx_s + int(prev_x * motion_scale), cy_s + int(prev_y * motion_scale))
+                img = cv2.arrowedLine(
+                    img, (cx_s, cy_s), tip,
+                    color=(255, 0, 0),
+                    thickness=arrow_thickness,
+                    tipLength=arrow_tip_length
+                )
 
         elif motion_branch_mode == "next":
-            # (x1, y1, x2, y2, obj_conf, class_conf, class_id, next_x, next_y)
             for x1, y1, x2, y2, obj_conf, class_conf, class_id, next_x, next_y in boxes:
                 score = obj_conf * class_conf
                 bbox = tuple(int(x * scale_multiplier) for x in (x1, y1, x2, y2))
@@ -234,11 +267,18 @@ def draw_bboxes_with_id(img, boxes, dataset_name: str, motion_branch_mode: str =
                 img = bbv.draw_rectangle(img, bbox, bbox_color=color)
                 img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
 
-                img = cv2.arrowedLine(img, (cx_s, cy_s), (cx_s + int(next_x * scale_multiplier), cy_s + int(next_y * scale_multiplier)), color=(0, 0, 255), thickness=2, tipLength=0.2)
+                tip = (cx_s + int(next_x * motion_scale), cy_s + int(next_y * motion_scale))
+                img = cv2.arrowedLine(
+                    img, (cx_s, cy_s), tip,
+                    color=(0, 0, 255),
+                    thickness=arrow_thickness,
+                    tipLength=arrow_tip_length
+                )
 
         else:
             raise ValueError(f"motion_branch_mode must be specified for 9 elements: got {motion_branch_mode}")
 
+    # --- 11要素形式 ---
     elif num_elems == 11:
         for cls_id, cx, cy, w, h, dx, dy, prev_dx, prev_dy, next_dx, next_dy in boxes:
             score = 1.0
@@ -246,22 +286,29 @@ def draw_bboxes_with_id(img, boxes, dataset_name: str, motion_branch_mode: str =
             pt2 = (int(cx + w / 2), int(cy + h / 2))
             bbox = tuple(int(x * scale_multiplier) for x in (*pt1, *pt2))
             cx_s, cy_s = int(cx * scale_multiplier), int(cy * scale_multiplier)
-            class_id = int(cls_id)
-            class_name = labelmap[class_id % len(labelmap)]
+            class_name = labelmap[int(cls_id) % len(labelmap)]
             bbox_txt = f"{class_name} {score:.2f}" if add_score else class_name
-            color = classid2colors[class_id]
+            color = classid2colors[int(cls_id)]
             img = bbv.draw_rectangle(img, bbox, bbox_color=color)
             img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
+
+            # 全ベクトルをスケールして描画
             for vec, col in [((dx, dy), (0, 255, 0)), ((prev_dx, prev_dy), (255, 0, 0)), ((next_dx, next_dy), (0, 0, 255))]:
-                tip = (cx_s + int(vec[0] * scale_multiplier), cy_s + int(vec[1] * scale_multiplier))
-                img = cv2.arrowedLine(img, (cx_s, cy_s), tip, color=col, thickness=2, tipLength=0.2)
+                vx, vy = vec
+                tip = (cx_s + int(vx * motion_scale), cy_s + int(vy * motion_scale))
+                img = cv2.arrowedLine(
+                    img,
+                    (cx_s, cy_s),
+                    tip,
+                    color=col,
+                    thickness=arrow_thickness,
+                    tipLength=arrow_tip_length
+                )
 
     else:
         raise ValueError(f"Invalid boxes format: got length {num_elems}")
 
     return img
-
-
 
 
 def visualize(video_writer: cv2.VideoWriter, ev_tensors: torch.Tensor, labels_yolox: torch.Tensor, pred_processed: torch.Tensor, dataset_name: str, motion_branch_mode: str = None):
