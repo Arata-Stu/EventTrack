@@ -8,6 +8,7 @@ from tqdm import tqdm
 import bbox_visualizer as bbv
 import cv2
 import numpy as np
+import random
 import torch
 import lightning as pl
 from einops import rearrange, reduce
@@ -18,6 +19,7 @@ from data.utils.types import DataType
 from data.genx_utils.labels import ObjectLabels
 from modules.utils.detection import RNNStates
 from models.layers.yolox.utils.boxes import postprocess, postprocess_with_motion
+from tracker.IoUTracker import IoUTracker 
 
 LABELMAP_GEN1 = ("car", "pedestrian")
 LABELMAP_GEN4 = ('pedestrian', 'two wheeler', 'car', 'truck', 'bus', 'traffic sign', 'traffic light')
@@ -315,6 +317,41 @@ def draw_bboxes_with_id(
 
     return img
 
+def draw_bounding_with_track_id(frame, tracked_objs):
+    """
+    フレームにバウンディングボックスとIDを色分けして描画する関数
+
+    Args:
+        frame (np.ndarray): 現在のフレーム
+        tracked_objs (list): トラッキングされたオブジェクトのリスト
+
+    Returns:
+        np.ndarray: 描画後のフレーム
+    """
+    # カラーマップをランダムで生成 (最大1000色)
+    color_map = {}
+    random.seed(42)  # 再現性を持たせるために固定
+    for i in range(1000):
+        color_map[i] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+
+    for obj_id, cx, cy, w, h in tracked_objs:
+        # バウンディングボックスの左上と右下の座標を計算
+        x1 = int(cx - w / 2)
+        y1 = int(cy - h / 2)
+        x2 = int(cx + w / 2)
+        y2 = int(cy + h / 2)
+
+        # IDに基づいて色を決定
+        color = color_map[obj_id % 1000]
+
+        # バウンディングボックスの描画
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        # オブジェクトIDの表示
+        cv2.putText(frame, f"ID: {obj_id}", (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+    
+    return frame
 
 def visualize(video_writer: cv2.VideoWriter, ev_tensors: torch.Tensor, labels_yolox: torch.Tensor, pred_processed: torch.Tensor, dataset_name: str, motion_branch_mode: str = None):
     img = ev_repr_to_img(ev_tensors.squeeze().cpu().numpy())
@@ -426,6 +463,131 @@ def create_video(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_
 
             ## 可視化
             visualize(video_writer, ev_tensors, labels_yolox, pred_processed, data.dataset_name, model.mdl_config.head.motion_branch_mode)
+
+    print(f"Video saved at {output_path}")
+    video_writer.release()
+
+
+
+def create_video_with_track(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_path: str ,show_gt: bool, show_pred: bool, output_path: str, fps: int, num_sequence: int, dataset_mode: DatasetMode):  
+
+    data_size =  dataset2size[data.dataset_name]
+    ## yolox or track
+    format = model.mdl_config.label.format
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(output_path, fourcc, fps, data_size)
+
+
+    if dataset_mode == "train":
+        print("mode: train")
+        data.setup('fit')
+        data_loader = data.train_dataloader()
+        model.setup("fit")
+    elif dataset_mode == "val":
+        print("mode: val")
+        data.setup('validate')
+        data_loader = data.val_dataloader()
+        model.setup("validate")
+    elif dataset_mode == "test":
+        print("mode: test")
+        data.setup('test')
+        data_loader = data.test_dataloader()
+        model.setup("test")
+    else:
+        raise ValueError(f"Invalid dataset mode: {dataset_mode}")
+    
+
+    num_classes = len(dataset2labelmap[data.dataset_name])
+
+    ## device 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if show_pred:
+        model.eval()
+        model.to(device)  # モデルをデバイスに移動
+        rnn_state = RNNStates()
+        size = model.in_res_hw
+        input_padder = InputPadderFromShape(size)
+
+    if ckpt_path is not None:
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt['state_dict'])
+
+    sequence_count = 0
+    
+
+    for batch in tqdm(data_loader):
+        data_batch = batch["data"]
+
+        ev_repr = data_batch[DataType.EV_REPR]
+        labels = data_batch[DataType.OBJLABELS_SEQ]
+        is_first_sample = data_batch[DataType.IS_FIRST_SAMPLE]
+
+        if show_pred:
+            rnn_state.reset(worker_id=0, indices_or_bool_tensor=is_first_sample)
+            prev_states = rnn_state.get_states(worker_id=0)
+
+        if is_first_sample.any():
+            sequence_count += 1
+            if sequence_count > num_sequence:
+                break
+            tracker = IoUTracker(max_lost=3, iou_threshold=0.6)
+            prev_states = None
+
+        labels_yolox = None
+        pred_processed = None
+
+        sequence_len = len(ev_repr)
+        for tidx in range(sequence_len):
+            ev_tensors = ev_repr[tidx]
+            ev_tensors = ev_tensors.to(torch.float32).to(device)  # デバイスに移動
+
+            ##ラベルを取得
+            if show_gt:
+                current_labels, valid_batch_indices = labels[tidx].get_valid_labels_and_batch_indices()
+                if len(current_labels) > 0:
+                    labels_yolox = ObjectLabels.get_labels_as_batched_tensor(obj_label_list=current_labels, format_=format)
+                    # print(labels_yolox)
+
+            ## モデルの推論
+            if show_pred:
+                ev_tensors_padded = input_padder.pad_tensor_ev_repr(ev_tensors)
+                if model.mdl.model_type == 'DNN':
+                    predictions, _ = model.forward(event_tensor=ev_tensors_padded)
+                elif model.mdl.model_type == 'RNN':
+                    predictions, _, states = model.forward(event_tensor=ev_tensors_padded, previous_states=prev_states)
+                    prev_states = states
+                    rnn_state.save_states_and_detach(worker_id=0, states=prev_states)
+                
+                if format == 'yolox':
+                    pred_processed = postprocess(predictions=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
+                elif format == 'track':
+                    pred_processed = postprocess_with_motion(prediction=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
+
+            ## 検出結果を保存
+            det_list = []
+
+            if pred_processed[0] is not None:
+                for x1, y1, x2, y2, obj_conf, class_conf, class_id, prev_dx, prev_dy, next_dx, next_dy in pred_processed[0].cpu().detach().numpy():
+                    cx = (x1 + x2) / 2
+                    cy = (y1 + y2) / 2
+                    w = x2 - x1
+                    h = y2 - y1
+                    
+                    # (cx, cy, w, h, prev_dx, prev_dy) 形式で格納
+                    det_list.append((cx, cy, w, h, prev_dx, prev_dy))
+
+            # トラッカー更新・取得
+            tracker.update(det_list)
+            tracked_objs = tracker.get_tracked_objects()
+
+            ## 可視化
+            ev_img = ev_repr.cpu().numpy().squeeze(0)  # [2, H, W]
+            frame = ev_repr_to_img(ev_img)
+            frame = draw_bounding_with_track_id(frame, tracked_objs)
+            # 動画への書き込み
+            video_writer.write(frame)
 
     print(f"Video saved at {output_path}")
     video_writer.release()
