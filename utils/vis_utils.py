@@ -321,7 +321,7 @@ def visualize(video_writer: cv2.VideoWriter, ev_tensors: torch.Tensor, labels_yo
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     if labels_yolox is not None and labels_yolox[0] is not None:
         labels_yolox = labels_yolox.cpu().numpy()[0]
-        img = draw_bboxes_with_id(img, pred_processed, dataset_name, motion_branch_mode=motion_branch_mode)
+        img = draw_bboxes_with_id(img, labels_yolox, dataset_name, motion_branch_mode=motion_branch_mode)
 
     if pred_processed is not None and pred_processed[0] is not None:
         pred_processed = pred_processed[0].detach().cpu().numpy()
