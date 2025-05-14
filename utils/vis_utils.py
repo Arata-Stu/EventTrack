@@ -280,20 +280,24 @@ def draw_bboxes_with_id(
 
     # --- 11要素形式 ---
     elif num_elems == 11:
-        for cls_id, cx, cy, w, h, dx, dy, prev_dx, prev_dy, next_dx, next_dy in boxes:
-            score = 1.0
-            pt1 = (int(cx - w / 2), int(cy - h / 2))
-            pt2 = (int(cx + w / 2), int(cy + h / 2))
-            bbox = tuple(int(x * scale_multiplier) for x in (*pt1, *pt2))
-            cx_s, cy_s = int(cx * scale_multiplier), int(cy * scale_multiplier)
-            class_name = labelmap[int(cls_id) % len(labelmap)]
+        for x1, y1, x2, y2, obj_conf, class_conf, class_id, prev_dx, prev_dy, next_dx, next_dy in boxes:
+            score = obj_conf * class_conf
+            bbox = tuple(int(x * scale_multiplier) for x in (x1, y1, x2, y2))
+            cx_s = int((x1 + x2) / 2 * scale_multiplier)
+            cy_s = int((y1 + y2) / 2 * scale_multiplier)
+            class_name = labelmap[int(class_id) % len(labelmap)]
             bbox_txt = f"{class_name} {score:.2f}" if add_score else class_name
-            color = classid2colors[int(cls_id)]
+            color = classid2colors[int(class_id)]
+            
+            # バウンディングボックスの描画
             img = bbv.draw_rectangle(img, bbox, bbox_color=color)
             img = bbv.add_label(img, bbox_txt, bbox, text_bg_color=color, top=True)
 
             # 全ベクトルをスケールして描画
-            for vec, col in [((dx, dy), (0, 255, 0)), ((prev_dx, prev_dy), (255, 0, 0)), ((next_dx, next_dy), (0, 0, 255))]:
+            for vec, col in [
+                ((prev_dx, prev_dy), (255, 0, 0)), 
+                ((next_dx, next_dy), (0, 0, 255))
+            ]:
                 vx, vy = vec
                 tip = (cx_s + int(vx * motion_scale), cy_s + int(vy * motion_scale))
                 img = cv2.arrowedLine(
@@ -304,6 +308,7 @@ def draw_bboxes_with_id(
                     thickness=arrow_thickness,
                     tipLength=arrow_tip_length
                 )
+
 
     else:
         raise ValueError(f"Invalid boxes format: got length {num_elems}")
