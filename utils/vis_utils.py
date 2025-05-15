@@ -15,6 +15,7 @@ from omegaconf import DictConfig
 from einops import rearrange, reduce
 
 from utils.padding import InputPadderFromShape
+from utils.timers import Timer
 from data.utils.types import DatasetMode, DataType
 from data.utils.types import DataType
 from data.genx_utils.labels import ObjectLabels
@@ -595,36 +596,37 @@ def create_video_with_track(data: pl.LightningDataModule, model: pl.LightningMod
                     labels_yolox = ObjectLabels.get_labels_as_batched_tensor(obj_label_list=current_labels, format_=format)
 
             ## モデルの推論
-            if show_pred:
-                ev_tensors_padded = input_padder.pad_tensor_ev_repr(ev_tensors)
-                if model.mdl.model_type == 'DNN':
-                    predictions, _ = model.forward(event_tensor=ev_tensors_padded)
-                elif model.mdl.model_type == 'RNN':
-                    predictions, _, states = model.forward(event_tensor=ev_tensors_padded, previous_states=prev_states)
-                    prev_states = states
-                    rnn_state.save_states_and_detach(worker_id=0, states=prev_states)
-                
-                if format == 'yolox':
-                    pred_processed = postprocess(predictions=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
-                elif format == 'track':
-                    pred_processed = postprocess_with_motion(prediction=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
-
-            ## 検出結果を保存
-            det_list = []
-
-            if pred_processed is not None:
-                for x1, y1, x2, y2, obj_conf, class_conf, class_id, prev_dx, prev_dy, next_dx, next_dy in pred_processed[0].cpu().detach().numpy():
-                    cx = (x1 + x2) / 2
-                    cy = (y1 + y2) / 2
-                    w = x2 - x1
-                    h = y2 - y1
+            with Timer(timer_name="det + IoU Track"):
+                if show_pred:
+                    ev_tensors_padded = input_padder.pad_tensor_ev_repr(ev_tensors)
+                    if model.mdl.model_type == 'DNN':
+                        predictions, _ = model.forward(event_tensor=ev_tensors_padded)
+                    elif model.mdl.model_type == 'RNN':
+                        predictions, _, states = model.forward(event_tensor=ev_tensors_padded, previous_states=prev_states)
+                        prev_states = states
+                        rnn_state.save_states_and_detach(worker_id=0, states=prev_states)
                     
-                    # (cx, cy, w, h, prev_dx, prev_dy, class_id) 形式で格納
-                    det_list.append((cx, cy, w, h, prev_dx, prev_dy, class_id))
+                    if format == 'yolox':
+                        pred_processed = postprocess(predictions=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
+                    elif format == 'track':
+                        pred_processed = postprocess_with_motion(prediction=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
 
-            # トラッカー更新・取得
-            tracker.update(det_list)
-            tracked_objs = tracker.get_tracked_objects()
+                ## 検出結果を保存
+                det_list = []
+
+                if pred_processed is not None:
+                    for x1, y1, x2, y2, obj_conf, class_conf, class_id, prev_dx, prev_dy, next_dx, next_dy in pred_processed[0].cpu().detach().numpy():
+                        cx = (x1 + x2) / 2
+                        cy = (y1 + y2) / 2
+                        w = x2 - x1
+                        h = y2 - y1
+                        
+                        # (cx, cy, w, h, prev_dx, prev_dy, class_id) 形式で格納
+                        det_list.append((cx, cy, w, h, prev_dx, prev_dy, class_id))
+
+                # トラッカー更新・取得
+                tracker.update(det_list)
+                tracked_objs = tracker.get_tracked_objects()
 
             ## 可視化
             ev_img = ev_tensors.cpu().numpy().squeeze(0)  # [2, H, W]
@@ -713,7 +715,6 @@ def create_video_with_bytetrack(
             info_imgs = (input_h, input_w)
             img_size  = [input_h, input_w]
             prev_states = None
-            # prev_states = rnn_state.get_states(worker_id=0)
         
         # フレーム単位推論
         for t in range(len(ev_repr)):
@@ -732,72 +733,70 @@ def create_video_with_bytetrack(
             
             # ——— 検出＆追跡
             if show_pred:
-                # pad & 推論
-                ev_padded = padder.pad_tensor_ev_repr(ev)
-                if model.mdl.model_type == 'DNN':
-                    preds, _ = model.forward(event_tensor=ev_padded)
-                else:
-                    # RNN
-                    if prev_states is None:
-                        rnn_state.reset(worker_id=0, indices_or_bool_tensor=is_first)
-                        prev_states = rnn_state.get_states(worker_id=0)
-                    preds, _, states = model.forward(
-                        event_tensor=ev_padded, previous_states=prev_states
-                    )
-                    prev_states = states
-                    rnn_state.save_states_and_detach(worker_id=0, states=states)
-                
-                # NMS 等
-                fmt = model.mdl_config.label.format
-                if fmt == 'yolox':
-                    dets = postprocess(predictions=preds, num_classes=num_classes,
-                                       conf_thre=0.1, nms_thre=0.45)
-                else:
-                    dets = postprocess_with_motion(prediction=preds, num_classes=num_classes,
-                                                   conf_thre=0.1, nms_thre=0.45)
-                
-                # numpy 化＆ByteTrack 用フォーマットへ
-                np_dets = dets[0].cpu().detach().numpy()  # OK
-                if np_dets.shape[0] > 0:
-                    bboxes = np_dets[:, :4].astype(np.float32)
-                    scores = (np_dets[:, 4] * np_dets[:, 5]).astype(np.float32).reshape(-1,1)
-                    output_results = np.concatenate([bboxes, scores], axis=1)
-                else:
-                    output_results = np.zeros((0,5), dtype=np.float32)
-                # ByteTrack 更新
-                online_targets = tracker.update(output_results, info_imgs, img_size)
-                
-                # STrack から情報抽出
-                online_tlwhs  = []
-                online_ids    = []
-                online_scores = []
-                for track in online_targets:
-                    tlwh = track.tlwh
-                    tid  = track.track_id
-                    scr  = track.score
-                    # 面積や縦長フィルタが必要ならここで判定
-                    online_tlwhs.append(tlwh)
-                    online_ids.append(tid)
-                    online_scores.append(scr)
+
+                with Timer(timer_name="det + ByteTrack"):
+                    # pad & 推論
+                    ev_padded = padder.pad_tensor_ev_repr(ev)
+                    if model.mdl.model_type == 'DNN':
+                        preds, _ = model.forward(event_tensor=ev_padded)
+                    else:
+                        # RNN
+                        if prev_states is None:
+                            rnn_state.reset(worker_id=0, indices_or_bool_tensor=is_first)
+                            prev_states = rnn_state.get_states(worker_id=0)
+                        preds, _, states = model.forward(
+                            event_tensor=ev_padded, previous_states=prev_states
+                        )
+                        prev_states = states
+                        rnn_state.save_states_and_detach(worker_id=0, states=states)
+                    
+                    # NMS 等
+                    fmt = model.mdl_config.label.format
+                    if fmt == 'yolox':
+                        dets = postprocess(predictions=preds, num_classes=num_classes,
+                                        conf_thre=0.1, nms_thre=0.45)
+                    else:
+                        dets = postprocess_with_motion(prediction=preds, num_classes=num_classes,
+                                                    conf_thre=0.1, nms_thre=0.45)
+                    
+                    # numpy 化＆ByteTrack 用フォーマットへ
+                    np_dets = dets[0].cpu().detach().numpy()  # OK
+                    if np_dets.shape[0] > 0:
+                        bboxes = np_dets[:, :4].astype(np.float32)
+                        scores = (np_dets[:, 4] * np_dets[:, 5]).astype(np.float32).reshape(-1,1)
+                        output_results = np.concatenate([bboxes, scores], axis=1)
+                    else:
+                        output_results = np.zeros((0,5), dtype=np.float32)
+                    # ByteTrack 更新
+                    online_targets = tracker.update(output_results, info_imgs, img_size)
+                    
+                    # STrack から情報抽出
+                    online_tlwhs  = []
+                    online_ids    = []
+                    online_scores = []
+                    for track in online_targets:
+                        tlwh = track.tlwh
+                        tid  = track.track_id
+                        scr  = track.score
+                        # 面積や縦長フィルタが必要ならここで判定
+                        online_tlwhs.append(tlwh)
+                        online_ids.append(tid)
+                        online_scores.append(scr)
                 
                 # 結果保存
                 frame_id = int(batch["frame_idx"][t]) if "frame_idx" in batch else None
+
                 # results.append((frame_id, online_tlwhs, online_ids, online_scores))
             ev_img = ev.cpu().detach().numpy().squeeze(0)  # [2, H, W]
             frame = ev_repr_to_img(ev_img)
 
-            visualize(
+            visualize_bytetrack(
                 writer=video_writer,
                 frame=frame,
                 tlwhs=online_tlwhs,
                 ids=online_ids,
                 scores=online_scores
             )
-            
-            # ——— 描画 or バッファ蓄積
-            # visualize(video_writer, ev, labels_yolox, online_tlwhs, online_ids, online_scores)
-        
-        # シーケンス終了後に必要な書き出し処理があればここで
     
     video_writer.release()
     print("Inference done.")

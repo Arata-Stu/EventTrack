@@ -35,9 +35,9 @@ def main(cfg: DictConfig):
     module = fetch_model_module(config=cfg)
         
     ##ビデオの作成
-    if cfg.tracker == 'iou':
+    if cfg.tracker.name == 'iou':
         create_video_with_track(data, module, ckpt_path, show_gt, show_pred, output_path, fps, num_sequence, dataset_mode, cfg.tracker)
-    elif cfg.tracker == 'bytetrack':
+    elif cfg.tracker.name == 'bytetrack':
         create_video_with_bytetrack(data, module, ckpt_path, show_gt, show_pred, output_path, fps, num_sequence, dataset_mode, cfg.tracker)
 if __name__ == '__main__':
     main()
