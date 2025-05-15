@@ -10,6 +10,7 @@ class TrackedObject:
         self.lost_frames = 0
     
     def predict_next_position(self):
+        # 現在の速度を利用して次のフレームの位置を予測
         self.cx += self.dx
         self.cy += self.dy
         return self.cx, self.cy
@@ -35,31 +36,51 @@ class IoUTracker:
     
     def update(self, detections):
         assigned = set()
+        
+        # IoUの計算とアサイン
         for oid, obj in list(self.objects.items()):
-            obj.predict_next_position()
+            predicted_cx, predicted_cy = obj.predict_next_position()
             best_iou = 0
             best_det = None
+            
             for det in detections:
                 if det in assigned:
                     continue
-                i = self.iou((obj.cx, obj.cy, obj.w, obj.h), det)
+                
+                # 予測位置でIoU計算
+                i = self.iou((predicted_cx, predicted_cy, obj.w, obj.h), det)
                 if i > best_iou and i > self.iou_threshold:
                     best_iou = i
                     best_det = det
+            
             if best_det is not None:
-                obj.cx, obj.cy, obj.w, obj.h = best_det
+                obj.cx, obj.cy, obj.w, obj.h = best_det[:4]
+                
+                if len(best_det) >= 6:
+                    obj.dx, obj.dy = best_det[4:6]
+                
                 assigned.add(best_det)
                 obj.lost_frames = 0
             else:
                 obj.lost_frames += 1
-            if obj.lost_frames > self.max_lost:
-                del self.objects[oid]
+
+        # ロストしたオブジェクトを削除
+        to_delete = [oid for oid, obj in self.objects.items() if obj.lost_frames > self.max_lost]
+        for oid in to_delete:
+            del self.objects[oid]
         
+        # 新しいオブジェクトの追加
         for det in detections:
             if det not in assigned:
-                # dx, dyも初期化時に渡す
-                self.objects[self.next_id] = TrackedObject(self.next_id, *det)
+                if len(det) == 6:
+                    cx, cy, w, h, dx, dy = det
+                else:
+                    cx, cy, w, h = det
+                    dx, dy = 0, 0
+
+                self.objects[self.next_id] = TrackedObject(self.next_id, cx, cy, w, h, dx, dy)
                 self.next_id += 1
-    
+
     def get_tracked_objects(self):
+        # dx, dy を除いて返す
         return [(o.object_id, o.cx, o.cy, o.w, o.h) for o in self.objects.values()]

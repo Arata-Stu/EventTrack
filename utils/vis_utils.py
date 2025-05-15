@@ -568,7 +568,7 @@ def create_video_with_track(data: pl.LightningDataModule , model: pl.LightningMo
             ## 検出結果を保存
             det_list = []
 
-            if pred_processed[0] is not None:
+            if pred_processed is not None:
                 for x1, y1, x2, y2, obj_conf, class_conf, class_id, prev_dx, prev_dy, next_dx, next_dy in pred_processed[0].cpu().detach().numpy():
                     cx = (x1 + x2) / 2
                     cy = (y1 + y2) / 2
@@ -583,7 +583,7 @@ def create_video_with_track(data: pl.LightningDataModule , model: pl.LightningMo
             tracked_objs = tracker.get_tracked_objects()
 
             ## 可視化
-            ev_img = ev_repr.cpu().numpy().squeeze(0)  # [2, H, W]
+            ev_img = ev_tensors.cpu().numpy().squeeze(0)  # [2, H, W]
             frame = ev_repr_to_img(ev_img)
             frame = draw_bounding_with_track_id(frame, tracked_objs)
             # 動画への書き込み
