@@ -1,28 +1,28 @@
 class TrackedObject:
-    def __init__(self, object_id, cx, cy, w, h, dx=0, dy=0):
-        self.object_id = object_id
-        self.cx = cx
-        self.cy = cy
-        self.w = w
-        self.h = h
-        self.dx = dx
-        self.dy = dy
-        self.lost_frames = 0
+    def __init__(self, object_id, cx, cy, w, h, class_id, dx=0, dy=0):
+        self.object_id = object_id   # オブジェクトID
+        self.cx = cx                 # 中心座標 X
+        self.cy = cy                 # 中心座標 Y
+        self.w = w                   # 幅
+        self.h = h                   # 高さ
+        self.class_id = class_id     # クラスID
+        self.dx = dx                 # X方向の速度
+        self.dy = dy                 # Y方向の速度
+        self.lost_frames = 0         # 見失ったフレーム数
     
     def predict_next_position(self):
-        # 現在の速度を利用して次のフレームの位置を予測
+        # 速度を元に次の位置を予測
         self.cx += self.dx
         self.cy += self.dy
         return self.cx, self.cy
 
-
 class IoUTracker:
     def __init__(self, max_lost=5, iou_threshold=0.3):
-        self.objects = {}
-        self.next_id = 0
-        self.max_lost = max_lost
+        self.objects = {}              # トラック中のオブジェクト
+        self.next_id = 0               # オブジェクトIDのカウンタ
+        self.max_lost = max_lost       # 最大ロストフレーム数
         self.iou_threshold = iou_threshold
-    
+
     def iou(self, boxA, boxB):
         xA = max(boxA[0] - boxA[2]/2, boxB[0] - boxB[2]/2)
         yA = max(boxA[1] - boxA[3]/2, boxB[1] - boxB[3]/2)
@@ -37,7 +37,6 @@ class IoUTracker:
     def update(self, detections):
         assigned = set()
         
-        # IoUの計算とアサイン
         for oid, obj in list(self.objects.items()):
             predicted_cx, predicted_cy = obj.predict_next_position()
             best_iou = 0
@@ -47,18 +46,29 @@ class IoUTracker:
                 if det in assigned:
                     continue
                 
-                # 予測位置でIoU計算
+                # 検出結果に Class ID が含まれる場合の処理
+                if len(det) == 7:
+                    cx, cy, w, h, dx, dy, class_id = det
+                elif len(det) == 6:
+                    cx, cy, w, h, dx, dy = det
+                    class_id = None
+                else:
+                    continue
+                
+                # クラスIDが異なる場合はスキップ
+                if class_id is not None and class_id != obj.class_id:
+                    continue
+
+                # IoU計算
                 i = self.iou((predicted_cx, predicted_cy, obj.w, obj.h), det)
                 if i > best_iou and i > self.iou_threshold:
                     best_iou = i
                     best_det = det
             
+            # アサインされた場合
             if best_det is not None:
                 obj.cx, obj.cy, obj.w, obj.h = best_det[:4]
-                
-                if len(best_det) >= 6:
-                    obj.dx, obj.dy = best_det[4:6]
-                
+                obj.dx, obj.dy = best_det[4:6]
                 assigned.add(best_det)
                 obj.lost_frames = 0
             else:
@@ -72,15 +82,15 @@ class IoUTracker:
         # 新しいオブジェクトの追加
         for det in detections:
             if det not in assigned:
-                if len(det) == 6:
-                    cx, cy, w, h, dx, dy = det
+                if len(det) == 7:
+                    cx, cy, w, h, dx, dy, class_id = det
                 else:
                     cx, cy, w, h = det
                     dx, dy = 0, 0
+                    class_id = None
 
-                self.objects[self.next_id] = TrackedObject(self.next_id, cx, cy, w, h, dx, dy)
+                self.objects[self.next_id] = TrackedObject(self.next_id, cx, cy, w, h, class_id, dx, dy)
                 self.next_id += 1
 
     def get_tracked_objects(self):
-        # dx, dy を除いて返す
-        return [(o.object_id, o.cx, o.cy, o.w, o.h) for o in self.objects.values()]
+        return [(o.object_id, o.cx, o.cy, o.w, o.h, o.dx, o.dy, o.class_id) for o in self.objects.values()]

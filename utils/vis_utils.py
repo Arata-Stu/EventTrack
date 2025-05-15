@@ -56,6 +56,18 @@ dataset2size = {
     "VGA": (640*1, 480*1),
 }
 
+# Track IDごとに色をキャッシュする辞書
+color_cache = {}
+
+def get_color_for_id(object_id):
+    """
+    Track IDごとにランダムな色を生成し、キャッシュする
+    """
+    if object_id not in color_cache:
+        # (R, G, B) のランダムな色
+        color_cache[object_id] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+    return color_cache[object_id]
+
 def ev_repr_to_img(x: np.ndarray):
     ch, ht, wd = x.shape[-3:]
     assert ch > 1 and ch % 2 == 0
@@ -317,41 +329,42 @@ def draw_bboxes_with_id(
 
     return img
 
-def draw_bounding_with_track_id(frame, tracked_objs):
+def draw_bounding_with_track_id(frame, tracked_objs, label_map=None):
     """
-    フレームにバウンディングボックスとIDを色分けして描画する関数
+    Bounding BoxとTrack IDを描画する関数
 
     Args:
-        frame (np.ndarray): 現在のフレーム
-        tracked_objs (list): トラッキングされたオブジェクトのリスト
-
-    Returns:
-        np.ndarray: 描画後のフレーム
+        frame (np.ndarray): 描画するフレーム
+        tracked_objs (list): [(id, cx, cy, w, h, dx, dy, class_id), ...]
+        label_map (dict): {class_id: class_name} のマッピング情報
     """
-    # カラーマップをランダムで生成 (最大1000色)
-    color_map = {}
-    random.seed(42)  # 再現性を持たせるために固定
-    for i in range(1000):
-        color_map[i] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
-
-    for obj_id, cx, cy, w, h in tracked_objs:
-        # バウンディングボックスの左上と右下の座標を計算
+    for obj_id, cx, cy, w, h, dx, dy, class_id in tracked_objs:
         x1 = int(cx - w / 2)
         y1 = int(cy - h / 2)
         x2 = int(cx + w / 2)
         y2 = int(cy + h / 2)
 
-        # IDに基づいて色を決定
-        color = color_map[obj_id % 1000]
+        # 色の取得 (Track IDごとに固定のランダム色)
+        color = get_color_for_id(obj_id)
 
         # バウンディングボックスの描画
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-        # オブジェクトIDの表示
-        cv2.putText(frame, f"ID: {obj_id}", (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-    
+        # クラス名の取得
+        class_name = label_map[class_id] if label_map and class_id in label_map else str(class_id)
+
+        # ラベルとIDの描画
+        text = f"{class_name} | ID: {obj_id}"
+        (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        
+        # ラベル表示用の背景
+        cv2.rectangle(frame, (x1, y1 - text_height - 5), (x1 + text_width, y1), color, thickness=-1)
+        
+        # ラベルのテキスト描画
+        cv2.putText(frame, text, (x1, y1 - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
     return frame
+
 
 def visualize(video_writer: cv2.VideoWriter, ev_tensors: torch.Tensor, labels_yolox: torch.Tensor, pred_processed: torch.Tensor, dataset_name: str, motion_branch_mode: str = None):
     img = ev_repr_to_img(ev_tensors.squeeze().cpu().numpy())
@@ -468,16 +481,15 @@ def create_video(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_
     video_writer.release()
 
 
+def create_video_with_track(data: pl.LightningDataModule, model: pl.LightningModule, ckpt_path: str,
+                            show_gt: bool, show_pred: bool, output_path: str, fps: int, num_sequence: int, 
+                            dataset_mode: DatasetMode):  
 
-def create_video_with_track(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_path: str ,show_gt: bool, show_pred: bool, output_path: str, fps: int, num_sequence: int, dataset_mode: DatasetMode):  
-
-    data_size =  dataset2size[data.dataset_name]
-    ## yolox or track
+    data_size = dataset2size[data.dataset_name]
     format = model.mdl_config.label.format
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     video_writer = cv2.VideoWriter(output_path, fourcc, fps, data_size)
-
 
     if dataset_mode == "train":
         print("mode: train")
@@ -497,7 +509,6 @@ def create_video_with_track(data: pl.LightningDataModule , model: pl.LightningMo
     else:
         raise ValueError(f"Invalid dataset mode: {dataset_mode}")
     
-
     num_classes = len(dataset2labelmap[data.dataset_name])
 
     ## device 
@@ -505,7 +516,7 @@ def create_video_with_track(data: pl.LightningDataModule , model: pl.LightningMo
 
     if show_pred:
         model.eval()
-        model.to(device)  # モデルをデバイスに移動
+        model.to(device)
         rnn_state = RNNStates()
         size = model.in_res_hw
         input_padder = InputPadderFromShape(size)
@@ -515,7 +526,6 @@ def create_video_with_track(data: pl.LightningDataModule , model: pl.LightningMo
         model.load_state_dict(ckpt['state_dict'])
 
     sequence_count = 0
-    
 
     for batch in tqdm(data_loader):
         data_batch = batch["data"]
@@ -543,12 +553,11 @@ def create_video_with_track(data: pl.LightningDataModule , model: pl.LightningMo
             ev_tensors = ev_repr[tidx]
             ev_tensors = ev_tensors.to(torch.float32).to(device)  # デバイスに移動
 
-            ##ラベルを取得
+            ## ラベルを取得
             if show_gt:
                 current_labels, valid_batch_indices = labels[tidx].get_valid_labels_and_batch_indices()
                 if len(current_labels) > 0:
                     labels_yolox = ObjectLabels.get_labels_as_batched_tensor(obj_label_list=current_labels, format_=format)
-                    # print(labels_yolox)
 
             ## モデルの推論
             if show_pred:
@@ -575,8 +584,8 @@ def create_video_with_track(data: pl.LightningDataModule , model: pl.LightningMo
                     w = x2 - x1
                     h = y2 - y1
                     
-                    # (cx, cy, w, h, prev_dx, prev_dy) 形式で格納
-                    det_list.append((cx, cy, w, h, prev_dx, prev_dy))
+                    # (cx, cy, w, h, prev_dx, prev_dy, class_id) 形式で格納
+                    det_list.append((cx, cy, w, h, prev_dx, prev_dy, class_id))
 
             # トラッカー更新・取得
             tracker.update(det_list)
@@ -585,7 +594,10 @@ def create_video_with_track(data: pl.LightningDataModule , model: pl.LightningMo
             ## 可視化
             ev_img = ev_tensors.cpu().numpy().squeeze(0)  # [2, H, W]
             frame = ev_repr_to_img(ev_img)
-            frame = draw_bounding_with_track_id(frame, tracked_objs)
+            
+            # 描画の際にClass IDも表示
+            frame = draw_bounding_with_track_id(frame, tracked_objs, dataset2labelmap[data.dataset_name])
+            
             # 動画への書き込み
             video_writer.write(frame)
 
