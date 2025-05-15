@@ -1,0 +1,6 @@
+name: bytetrack ## iou or bytetrack
+track_thresh: 0.3
+track_buffer: 3
+match_thresh: 0.8
+min_box_area: 10.0
+mot20: False

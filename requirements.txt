@@ -30,3 +30,7 @@ plotly
 
 # データセット関連
 pycocotools
+
+# bytetrack
+cython_bbox
+lap

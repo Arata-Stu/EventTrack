@@ -11,6 +11,7 @@ import numpy as np
 import random
 import torch
 import lightning as pl
+from omegaconf import DictConfig
 from einops import rearrange, reduce
 
 from utils.padding import InputPadderFromShape
@@ -20,6 +21,7 @@ from data.genx_utils.labels import ObjectLabels
 from modules.utils.detection import RNNStates
 from models.layers.yolox.utils.boxes import postprocess, postprocess_with_motion
 from tracker.IoUTracker import IoUTracker 
+from tracker.byte_tracker import BYTETracker
 
 LABELMAP_GEN1 = ("car", "pedestrian")
 LABELMAP_GEN4 = ('pedestrian', 'two wheeler', 'car', 'truck', 'bus', 'traffic sign', 'traffic light')
@@ -365,6 +367,39 @@ def draw_bounding_with_track_id(frame, tracked_objs, label_map=None):
 
     return frame
 
+def visualize_bytetrack(writer, frame, tlwhs, ids, scores=None, labelmap=None):
+    """
+    frame に対してトラッキング結果を描画し、VideoWriter に書き込む。
+
+    Args:
+        writer   : cv2.VideoWriter インスタンス
+        frame    : 描画対象の BGR 画像 (np.ndarray)
+        tlwhs    : List of [x, y, w, h]
+        ids      : List of track_id
+        scores   : ある場合は List of confidence score
+        labelmap : ある場合はクラス名のタプル等
+    """
+    img = frame.copy()
+    for i, (tlwh, tid) in enumerate(zip(tlwhs, ids)):
+        x, y, w, h = map(int, tlwh)
+        # バウンディングボックス
+        cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+        # ラベル文字列（例: "ID:3 0.82"）
+        label = f"ID:{tid}"
+        if scores is not None:
+            label += f" {scores[i]:.2f}"
+        # テキスト描画
+        cv2.putText(
+            img, label, 
+            (x, y - 5), 
+            cv2.FONT_HERSHEY_SIMPLEX, 
+            0.5, (255, 255, 255), 1, cv2.LINE_AA
+        )
+
+    # フレーム書き出し
+    writer.write(img)
+
 
 def visualize(video_writer: cv2.VideoWriter, ev_tensors: torch.Tensor, labels_yolox: torch.Tensor, pred_processed: torch.Tensor, dataset_name: str, motion_branch_mode: str = None):
     img = ev_repr_to_img(ev_tensors.squeeze().cpu().numpy())
@@ -483,7 +518,7 @@ def create_video(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_
 
 def create_video_with_track(data: pl.LightningDataModule, model: pl.LightningModule, ckpt_path: str,
                             show_gt: bool, show_pred: bool, output_path: str, fps: int, num_sequence: int, 
-                            dataset_mode: DatasetMode):  
+                            dataset_mode: DatasetMode, tracker_cfg: DictConfig):  
 
     data_size = dataset2size[data.dataset_name]
     format = model.mdl_config.label.format
@@ -542,7 +577,7 @@ def create_video_with_track(data: pl.LightningDataModule, model: pl.LightningMod
             sequence_count += 1
             if sequence_count > num_sequence:
                 break
-            tracker = IoUTracker(max_lost=3, iou_threshold=0.6)
+            tracker = IoUTracker(max_lost=tracker_cfg.track_buffer, iou_threshold=tracker_cfg.iou_threshold)
             prev_states = None
 
         labels_yolox = None
@@ -603,3 +638,166 @@ def create_video_with_track(data: pl.LightningDataModule, model: pl.LightningMod
 
     print(f"Video saved at {output_path}")
     video_writer.release()
+
+
+def create_video_with_bytetrack(
+    data: pl.LightningDataModule,
+    model: pl.LightningModule,
+    ckpt_path: str,
+    show_gt: bool,
+    show_pred: bool,
+    output_path: str,
+    fps: int,
+    num_sequence: int,
+    dataset_mode: DatasetMode,
+    args,  # BYTETracker 用に args を追加
+):
+    # 書き出し準備
+    size = dataset2size[data.dataset_name]
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(output_path, fourcc, fps, size)
+    
+    # DataModule モード切り替え
+    if dataset_mode == "train":
+        data.setup('fit')
+        loader = data.train_dataloader()
+        model.setup("fit")
+    elif dataset_mode == "val":
+        data.setup('validate')
+        loader = data.val_dataloader()
+        model.setup("validate")
+    elif dataset_mode == "test":
+        data.setup('test')
+        loader = data.test_dataloader()
+        model.setup("test")
+    else:
+        raise ValueError(f"Invalid mode: {dataset_mode}")
+    
+    num_classes = len(dataset2labelmap[data.dataset_name])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 推論用設定
+    if show_pred:
+        model.eval().to(device)
+        rnn_state = RNNStates()
+        padder = InputPadderFromShape(model.in_res_hw)  # 入力サイズ (H, W)
+    
+    # チェックポイント読み込み
+    if ckpt_path:
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt['state_dict'])
+    
+    sequence_count = 0
+    tracker = None
+    info_imgs = None
+    img_size  = None
+    
+    for batch in tqdm(loader):
+        ev_repr = batch["data"][DataType.EV_REPR]
+        labels  = batch["data"][DataType.OBJLABELS_SEQ]
+        is_first = batch["data"][DataType.IS_FIRST_SAMPLE]
+        
+        if show_pred:
+            rnn_state.reset(worker_id=0, indices_or_bool_tensor=is_first)
+            prev_states = rnn_state.get_states(worker_id=0)
+
+
+        # 新シーケンス開始時にトラッカーを初期化
+        if is_first.any():
+            sequence_count += 1
+            if sequence_count > num_sequence:
+                break
+            tracker = BYTETracker(args=args, frame_rate=fps)
+            # モデル入力サイズ＝パディング後のサイズを info として使う
+            input_h, input_w = model.in_res_hw
+            info_imgs = (input_h, input_w)
+            img_size  = [input_h, input_w]
+            prev_states = None
+            # prev_states = rnn_state.get_states(worker_id=0)
+        
+        # フレーム単位推論
+        for t in range(len(ev_repr)):
+            ev = ev_repr[t].to(torch.float32).to(device)
+            
+            # ——— GT 用意（不要ならスキップ）
+            if show_gt:
+                cur_labels, valid_idx = labels[t].get_valid_labels_and_batch_indices()
+                if len(cur_labels) > 0:
+                    labels_yolox = ObjectLabels.get_labels_as_batched_tensor(
+                        obj_label_list=cur_labels,
+                        format_=model.mdl_config.label.format
+                    )
+                else:
+                    labels_yolox = None
+            
+            # ——— 検出＆追跡
+            if show_pred:
+                # pad & 推論
+                ev_padded = padder.pad_tensor_ev_repr(ev)
+                if model.mdl.model_type == 'DNN':
+                    preds, _ = model.forward(event_tensor=ev_padded)
+                else:
+                    # RNN
+                    if prev_states is None:
+                        rnn_state.reset(worker_id=0, indices_or_bool_tensor=is_first)
+                        prev_states = rnn_state.get_states(worker_id=0)
+                    preds, _, states = model.forward(
+                        event_tensor=ev_padded, previous_states=prev_states
+                    )
+                    prev_states = states
+                    rnn_state.save_states_and_detach(worker_id=0, states=states)
+                
+                # NMS 等
+                fmt = model.mdl_config.label.format
+                if fmt == 'yolox':
+                    dets = postprocess(predictions=preds, num_classes=num_classes,
+                                       conf_thre=0.1, nms_thre=0.45)
+                else:
+                    dets = postprocess_with_motion(prediction=preds, num_classes=num_classes,
+                                                   conf_thre=0.1, nms_thre=0.45)
+                
+                # numpy 化＆ByteTrack 用フォーマットへ
+                np_dets = dets[0].cpu().detach().numpy()  # OK
+                if np_dets.shape[0] > 0:
+                    bboxes = np_dets[:, :4].astype(np.float32)
+                    scores = (np_dets[:, 4] * np_dets[:, 5]).astype(np.float32).reshape(-1,1)
+                    output_results = np.concatenate([bboxes, scores], axis=1)
+                else:
+                    output_results = np.zeros((0,5), dtype=np.float32)
+                # ByteTrack 更新
+                online_targets = tracker.update(output_results, info_imgs, img_size)
+                
+                # STrack から情報抽出
+                online_tlwhs  = []
+                online_ids    = []
+                online_scores = []
+                for track in online_targets:
+                    tlwh = track.tlwh
+                    tid  = track.track_id
+                    scr  = track.score
+                    # 面積や縦長フィルタが必要ならここで判定
+                    online_tlwhs.append(tlwh)
+                    online_ids.append(tid)
+                    online_scores.append(scr)
+                
+                # 結果保存
+                frame_id = int(batch["frame_idx"][t]) if "frame_idx" in batch else None
+                # results.append((frame_id, online_tlwhs, online_ids, online_scores))
+            ev_img = ev.cpu().detach().numpy().squeeze(0)  # [2, H, W]
+            frame = ev_repr_to_img(ev_img)
+
+            visualize(
+                writer=video_writer,
+                frame=frame,
+                tlwhs=online_tlwhs,
+                ids=online_ids,
+                scores=online_scores
+            )
+            
+            # ——— 描画 or バッファ蓄積
+            # visualize(video_writer, ev, labels_yolox, online_tlwhs, online_ids, online_scores)
+        
+        # シーケンス終了後に必要な書き出し処理があればここで
+    
+    video_writer.release()
+    print("Inference done.")

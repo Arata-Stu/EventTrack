@@ -1,0 +1,3 @@
+name: iou ## iou or bytetrack
+iou_threshold: 0.3
+max_lost: 3
