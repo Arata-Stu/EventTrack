@@ -1,4 +1,4 @@
-# model, dataset, bins, accum_t_ms, mAP
+model,dataset,bins,accum_t_ms,mAP
 RVT, gen1, 1, 5, 0.3609
 RVT, gen1, 1, 10, 0.3975
 RVT, gen1, 1, 20, 0.4259
@@ -69,21 +69,21 @@ YOLOX-LSTM, gen1, 10, 10, 0.4107
 YOLOX-LSTM, gen1, 10, 20, 0.4399
 YOLOX-LSTM, gen1, 10, 50, 0.4695
 YOLOX-LSTM, gen1, 10, 100, 0.4686
-YOLOX-LSTM, gen4, 1, 5, ???
-YOLOX-LSTM, gen4, 1, 10, ???
-YOLOX-LSTM, gen4, 1, 20, ???
-YOLOX-LSTM, gen4, 1, 50, ???
-YOLOX-LSTM, gen4, 1, 100, ???
+YOLOX-LSTM, gen4, 1, 5, 0.3515
+YOLOX-LSTM, gen4, 1, 10, 0.3724
+YOLOX-LSTM, gen4, 1, 20, 0.3958
+YOLOX-LSTM, gen4, 1, 50, 0.4107
+YOLOX-LSTM, gen4, 1, 100, 0.3950
 YOLOX-LSTM, gen4, 10, 5, 0.3494
 YOLOX-LSTM, gen4, 10, 10, 0.3711
 YOLOX-LSTM, gen4, 10, 20, 0.3760
 YOLOX-LSTM, gen4, 10, 50, 0.3934
 YOLOX-LSTM, gen4, 10, 100, 0.3944
-YOLOX-LSTM, dsec, 1, 5, ???
-YOLOX-LSTM, dsec, 1, 10, ???
-YOLOX-LSTM, dsec, 1, 20, ???
-YOLOX-LSTM, dsec, 1, 50, ???
-YOLOX-LSTM, dsec, 1, 100, ???
+YOLOX-LSTM, dsec, 1, 5, 0.5859
+YOLOX-LSTM, dsec, 1, 10, 0.5932
+YOLOX-LSTM, dsec, 1, 20, 0.6244
+YOLOX-LSTM, dsec, 1, 50, 0.5662
+YOLOX-LSTM, dsec, 1, 100, 0.5483
 YOLOX-LSTM, dsec, 10, 5, 0.5644
 YOLOX-LSTM, dsec, 10, 10, 0.5889
 YOLOX-LSTM, dsec, 10, 20, 0.6025
