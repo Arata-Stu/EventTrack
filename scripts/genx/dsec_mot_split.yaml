@@ -1,0 +1,15 @@
+train:
+  - interlaken_00_a
+  - interlaken_00_b
+  - interlaken_00_c
+  - interlaken_00_e
+  - zurich_city_01_d
+  - zurich_city_01_e
+  - zurich_city_04_b
+  - zurich_city_09_c
+  - zurich_city_09_d
+  - zurich_city_14_b
+
+test:
+  - interlaken_00_d
+  - zurich_city_00_b
