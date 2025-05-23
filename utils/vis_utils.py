@@ -368,6 +368,7 @@ def draw_bounding_with_track_id(frame, tracked_objs, label_map=None):
 
     return frame
 
+
 def visualize_bytetrack(writer, frame, tlwhs, ids, scores=None, labelmap=None):
     """
     frame に対してトラッキング結果を描画し、VideoWriter に書き込む。
@@ -383,22 +384,29 @@ def visualize_bytetrack(writer, frame, tlwhs, ids, scores=None, labelmap=None):
     img = frame.copy()
     for i, (tlwh, tid) in enumerate(zip(tlwhs, ids)):
         x, y, w, h = map(int, tlwh)
-        # バウンディングボックス
-        cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        color = get_color_for_id(tid)  # IDに基づく色
 
-        # ラベル文字列（例: "ID:3 0.82"）
+        # バウンディングボックス描画
+        cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
+
+        # ラベル文字列
         label = f"ID:{tid}"
         if scores is not None:
             label += f" {scores[i]:.2f}"
-        # テキスト描画
+
+        # ラベル背景
+        (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(img, (x, y - text_height - 4), (x + text_width, y), color, -1)
+
+        # ラベルテキスト描画
         cv2.putText(
-            img, label, 
-            (x, y - 5), 
-            cv2.FONT_HERSHEY_SIMPLEX, 
+            img, label,
+            (x, y - 3),
+            cv2.FONT_HERSHEY_SIMPLEX,
             0.5, (255, 255, 255), 1, cv2.LINE_AA
         )
 
-    # フレーム書き出し
+    # 書き込み
     writer.write(img)
 
 
