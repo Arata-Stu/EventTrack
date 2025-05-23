@@ -13,6 +13,7 @@ import torch
 import lightning as pl
 from omegaconf import DictConfig
 from einops import rearrange, reduce
+from typing import Optional
 
 from utils.padding import InputPadderFromShape
 from utils.timers import Timer
@@ -369,45 +370,47 @@ def draw_bounding_with_track_id(frame, tracked_objs, label_map=None):
     return frame
 
 
-def visualize_bytetrack(writer, frame, tlwhs, ids, scores=None, labelmap=None):
+def visualize_bytetrack(
+    frame: np.ndarray,
+    tlwhs: list,
+    ids: list,
+    scores: Optional[list] = None,
+    labelmap: Optional[tuple] = None
+) -> np.ndarray:
     """
-    frame に対してトラッキング結果を描画し、VideoWriter に書き込む。
-
+    ByteTrack結果をフレームに描画して返す
     Args:
-        writer   : cv2.VideoWriter インスタンス
-        frame    : 描画対象の BGR 画像 (np.ndarray)
-        tlwhs    : List of [x, y, w, h]
-        ids      : List of track_id
-        scores   : ある場合は List of confidence score
-        labelmap : ある場合はクラス名のタプル等
+        frame   : BGR画像 (H x W x 3)
+        tlwhs   : List of [x, y, w, h]
+        ids     : List of track IDs
+        scores  : Optional[List of confidence scores]
+        labelmap: Optional labelmap tuple
+    Returns:
+        描画後のフレーム
     """
     img = frame.copy()
     for i, (tlwh, tid) in enumerate(zip(tlwhs, ids)):
         x, y, w, h = map(int, tlwh)
-        color = get_color_for_id(tid)  # IDに基づく色
+        color = get_color_for_id(tid)
 
-        # バウンディングボックス描画
+        # バウンディングボックス
         cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
 
-        # ラベル文字列
+        # ラベルテキスト
         label = f"ID:{tid}"
         if scores is not None:
             label += f" {scores[i]:.2f}"
+        if labelmap is not None:
+            cls_idx = int(ids[i])
+            if cls_idx < len(labelmap):
+                label = labelmap[cls_idx] + " " + label
 
-        # ラベル背景
-        (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(img, (x, y - text_height - 4), (x + text_width, y), color, -1)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(img, (x, y - th - 4), (x + tw, y), color, -1)
+        cv2.putText(img, label, (x, y - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        # ラベルテキスト描画
-        cv2.putText(
-            img, label,
-            (x, y - 3),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5, (255, 255, 255), 1, cv2.LINE_AA
-        )
+    return img
 
-    # 書き込み
-    writer.write(img)
 
 
 def visualize(video_writer: cv2.VideoWriter, ev_tensors: torch.Tensor, labels_yolox: torch.Tensor, pred_processed: torch.Tensor, dataset_name: str, motion_branch_mode: str = None):
@@ -525,286 +528,132 @@ def create_video(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_
     video_writer.release()
 
 
-def create_video_with_track(data: pl.LightningDataModule, model: pl.LightningModule, ckpt_path: str,
-                            show_gt: bool, show_pred: bool, output_path: str, fps: int, num_sequence: int, 
-                            dataset_mode: DatasetMode, tracker_cfg: DictConfig):  
-
-    data_size = dataset2size[data.dataset_name]
-    format = model.mdl_config.label.format
-
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video_writer = cv2.VideoWriter(output_path, fourcc, fps, data_size)
-
-    if dataset_mode == "train":
-        print("mode: train")
-        data.setup('fit')
-        data_loader = data.train_dataloader()
-        model.setup("fit")
-    elif dataset_mode == "val":
-        print("mode: val")
-        data.setup('validate')
-        data_loader = data.val_dataloader()
-        model.setup("validate")
-    elif dataset_mode == "test":
-        print("mode: test")
-        data.setup('test')
-        data_loader = data.test_dataloader()
-        model.setup("test")
-    else:
-        raise ValueError(f"Invalid dataset mode: {dataset_mode}")
-    
-    num_classes = len(dataset2labelmap[data.dataset_name])
-
-    ## device 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    if show_pred:
-        model.eval()
-        model.to(device)
-        rnn_state = RNNStates()
-        size = model.in_res_hw
-        input_padder = InputPadderFromShape(size)
-
-    if ckpt_path is not None:
-        ckpt = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(ckpt['state_dict'])
-
-    sequence_count = 0
-
-    for batch in tqdm(data_loader):
-        data_batch = batch["data"]
-
-        ev_repr = data_batch[DataType.EV_REPR]
-        labels = data_batch[DataType.OBJLABELS_SEQ]
-        is_first_sample = data_batch[DataType.IS_FIRST_SAMPLE]
-
-        if show_pred:
-            rnn_state.reset(worker_id=0, indices_or_bool_tensor=is_first_sample)
-            prev_states = rnn_state.get_states(worker_id=0)
-
-        if is_first_sample.any():
-            sequence_count += 1
-            if sequence_count > num_sequence:
-                break
-            tracker = IoUTracker(max_lost=tracker_cfg.track_buffer, iou_threshold=tracker_cfg.iou_threshold)
-            prev_states = None
-
-        labels_yolox = None
-        pred_processed = None
-
-        sequence_len = len(ev_repr)
-        for tidx in range(sequence_len):
-            ev_tensors = ev_repr[tidx]
-            ev_tensors = ev_tensors.to(torch.float32).to(device)  # デバイスに移動
-
-            ## ラベルを取得
-            if show_gt:
-                current_labels, valid_batch_indices = labels[tidx].get_valid_labels_and_batch_indices()
-                if len(current_labels) > 0:
-                    labels_yolox = ObjectLabels.get_labels_as_batched_tensor(obj_label_list=current_labels, format_=format)
-
-            ## モデルの推論
-            with Timer(timer_name="det + IoU Track"):
-                if show_pred:
-                    ev_tensors_padded = input_padder.pad_tensor_ev_repr(ev_tensors)
-                    if model.mdl.model_type == 'DNN':
-                        predictions, _ = model.forward(event_tensor=ev_tensors_padded)
-                    elif model.mdl.model_type == 'RNN':
-                        predictions, _, states = model.forward(event_tensor=ev_tensors_padded, previous_states=prev_states)
-                        prev_states = states
-                        rnn_state.save_states_and_detach(worker_id=0, states=prev_states)
-                    
-                    if format == 'yolox':
-                        pred_processed = postprocess(predictions=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
-                    elif format == 'track':
-                        pred_processed = postprocess_with_motion(prediction=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
-
-                ## 検出結果を保存
-                det_list = []
-
-                if pred_processed is not None:
-                    for x1, y1, x2, y2, obj_conf, class_conf, class_id, prev_dx, prev_dy, next_dx, next_dy in pred_processed[0].cpu().detach().numpy():
-                        cx = (x1 + x2) / 2
-                        cy = (y1 + y2) / 2
-                        w = x2 - x1
-                        h = y2 - y1
-                        
-                        # (cx, cy, w, h, prev_dx, prev_dy, class_id) 形式で格納
-                        det_list.append((cx, cy, w, h, prev_dx, prev_dy, class_id))
-
-                # トラッカー更新・取得
-                tracker.update(det_list)
-                tracked_objs = tracker.get_tracked_objects()
-
-            ## 可視化
-            ev_img = ev_tensors.cpu().numpy().squeeze(0)  # [2, H, W]
-            frame = ev_repr_to_img(ev_img)
-            
-            # 描画の際にClass IDも表示
-            frame = draw_bounding_with_track_id(frame, tracked_objs, dataset2labelmap[data.dataset_name])
-            
-            # 動画への書き込み
-            video_writer.write(frame)
-
-    print(f"Video saved at {output_path}")
-    video_writer.release()
-
-
-def create_video_with_bytetrack(
+def create_video_with_track(
     data: pl.LightningDataModule,
     model: pl.LightningModule,
-    ckpt_path: str,
+    ckpt_path: Optional[str],
     show_gt: bool,
     show_pred: bool,
     output_path: str,
     fps: int,
     num_sequence: int,
     dataset_mode: DatasetMode,
-    args,  # BYTETracker 用に args を追加
+    tracker_cfg: Optional[DictConfig] = None
 ):
-    # 書き出し準備
-    size = dataset2size[data.dataset_name]
+    tracker_type = tracker_cfg.name
+    # --- VideoWriter設定 ---
+    frame_size = dataset2size[data.dataset_name]
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video_writer = cv2.VideoWriter(output_path, fourcc, fps, size)
-    
-    # DataModule モード切り替え
+    video_writer = cv2.VideoWriter(output_path, fourcc, fps, frame_size)
+
+    # --- DataLoader & Model準備 ---
     if dataset_mode == "train":
-        data.setup('fit')
-        loader = data.train_dataloader()
-        model.setup("fit")
+        data.setup('fit'); loader = data.train_dataloader(); model.setup('fit')
     elif dataset_mode == "val":
-        data.setup('validate')
-        loader = data.val_dataloader()
-        model.setup("validate")
+        data.setup('validate'); loader = data.val_dataloader(); model.setup('validate')
     elif dataset_mode == "test":
-        data.setup('test')
-        loader = data.test_dataloader()
-        model.setup("test")
+        data.setup('test'); loader = data.test_dataloader(); model.setup('test')
     else:
-        raise ValueError(f"Invalid mode: {dataset_mode}")
-    
-    num_classes = len(dataset2labelmap[data.dataset_name])
+        raise ValueError(f"Invalid dataset mode: {dataset_mode}")
+
+    # --- Checkpoint読み込み ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # 推論用設定
-    if show_pred:
-        model.eval().to(device)
-        rnn_state = RNNStates()
-        padder = InputPadderFromShape(model.in_res_hw)  # 入力サイズ (H, W)
-    
-    # チェックポイント読み込み
     if ckpt_path:
         ckpt = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(ckpt['state_dict'])
-    
+
+    # --- 推論準備 ---
+    num_classes = len(dataset2labelmap[data.dataset_name])
+    if show_pred:
+        model.eval().to(device)
+        rnn_state = RNNStates()
+        padder = InputPadderFromShape(model.in_res_hw)
+
     sequence_count = 0
     tracker = None
-    info_imgs = None
-    img_size  = None
-    
-    for batch in tqdm(loader):
-        ev_repr = batch["data"][DataType.EV_REPR]
-        labels  = batch["data"][DataType.OBJLABELS_SEQ]
-        is_first = batch["data"][DataType.IS_FIRST_SAMPLE]
-        
+    info_imgs, img_size = None, None
+
+    # --- メインループ ---
+    for batch in tqdm(loader, desc="Processing Sequences"):
+        ev_repr = batch['data'][DataType.EV_REPR]
+        labels  = batch['data'][DataType.OBJLABELS_SEQ]
+        is_first = batch['data'][DataType.IS_FIRST_SAMPLE]
+
         if show_pred:
             rnn_state.reset(worker_id=0, indices_or_bool_tensor=is_first)
             prev_states = rnn_state.get_states(worker_id=0)
 
-
-        # 新シーケンス開始時にトラッカーを初期化
+        # 新シーケンス開始
         if is_first.any():
             sequence_count += 1
             if sequence_count > num_sequence:
                 break
-            tracker = BYTETracker(args=args, frame_rate=fps)
-            # モデル入力サイズ＝パディング後のサイズを info として使う
-            input_h, input_w = model.in_res_hw
-            info_imgs = (input_h, input_w)
-            img_size  = [input_h, input_w]
+            if tracker_type == 'iou':
+                tracker = IoUTracker(max_lost=tracker_cfg.track_buffer, iou_threshold=tracker_cfg.iou_threshold)
+            elif tracker_type == 'bytetrack':
+                tracker = BYTETracker(args=tracker_cfg, frame_rate=fps)
+                h, w = model.in_res_hw
+                info_imgs = (h, w)
+                img_size = [h, w]
+            else:
+                raise ValueError(f"Unknown tracker type: {tracker_type}")
             prev_states = None
-        
+
         # フレーム単位推論
         for t in range(len(ev_repr)):
             ev = ev_repr[t].to(torch.float32).to(device)
-            
-            # ——— GT 用意（不要ならスキップ）
+
             if show_gt:
                 cur_labels, valid_idx = labels[t].get_valid_labels_and_batch_indices()
-                if len(cur_labels) > 0:
-                    labels_yolox = ObjectLabels.get_labels_as_batched_tensor(
-                        obj_label_list=cur_labels,
-                        format_=model.mdl_config.label.format
-                    )
-                else:
-                    labels_yolox = None
-            
-            # ——— 検出＆追跡
-            if show_pred:
+                # GT描画用 tensor 処理省略
 
-                with Timer(timer_name="det + ByteTrack"):
-                    # pad & 推論
+            if show_pred:
+                with Timer(timer_name="Detection + Tracking"):
                     ev_padded = padder.pad_tensor_ev_repr(ev)
                     if model.mdl.model_type == 'DNN':
                         preds, _ = model.forward(event_tensor=ev_padded)
                     else:
-                        # RNN
-                        if prev_states is None:
-                            rnn_state.reset(worker_id=0, indices_or_bool_tensor=is_first)
-                            prev_states = rnn_state.get_states(worker_id=0)
-                        preds, _, states = model.forward(
-                            event_tensor=ev_padded, previous_states=prev_states
-                        )
-                        prev_states = states
-                        rnn_state.save_states_and_detach(worker_id=0, states=states)
-                    
-                    # NMS 等
+                        preds, _, new_states = model.forward(event_tensor=ev_padded, previous_states=prev_states)
+                        prev_states = new_states
+                        rnn_state.save_states_and_detach(worker_id=0, states=new_states)
+
                     fmt = model.mdl_config.label.format
                     if fmt == 'yolox':
-                        dets = postprocess(predictions=preds, num_classes=num_classes,
-                                        conf_thre=0.1, nms_thre=0.45)
+                        dets = postprocess(predictions=preds, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
                     else:
-                        dets = postprocess_with_motion(prediction=preds, num_classes=num_classes,
-                                                    conf_thre=0.1, nms_thre=0.45)
-                    
-                    # numpy 化＆ByteTrack 用フォーマットへ
-                    np_dets = dets[0].cpu().detach().numpy()  # OK
-                    if np_dets.shape[0] > 0:
-                        bboxes = np_dets[:, :4].astype(np.float32)
-                        scores = (np_dets[:, 4] * np_dets[:, 5]).astype(np.float32).reshape(-1,1)
-                        output_results = np.concatenate([bboxes, scores], axis=1)
-                    else:
-                        output_results = np.zeros((0,5), dtype=np.float32)
-                    # ByteTrack 更新
-                    online_targets = tracker.update(output_results, info_imgs, img_size)
-                    
-                    # STrack から情報抽出
-                    online_tlwhs  = []
-                    online_ids    = []
-                    online_scores = []
-                    for track in online_targets:
-                        tlwh = track.tlwh
-                        tid  = track.track_id
-                        scr  = track.score
-                        # 面積や縦長フィルタが必要ならここで判定
-                        online_tlwhs.append(tlwh)
-                        online_ids.append(tid)
-                        online_scores.append(scr)
-                
-                # 結果保存
-                frame_id = int(batch["frame_idx"][t]) if "frame_idx" in batch else None
+                        dets = postprocess_with_motion(prediction=preds, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
 
-                # results.append((frame_id, online_tlwhs, online_ids, online_scores))
-            ev_img = ev.cpu().detach().numpy().squeeze(0)  # [2, H, W]
+                # トラッカー更新
+                if tracker_type == 'iou':
+                    det_list = []
+                    for *box, prev_dx, prev_dy, next_dx, next_dy, class_id in dets[0].cpu().numpy():
+                        x1, y1, x2, y2 = box
+                        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                        det_list.append((cx, cy, x2-x1, y2-y1, prev_dx, prev_dy, class_id))
+                    tracker.update(det_list)
+                    tracked = tracker.get_tracked_objects()
+                else:
+                    arr = dets[0].detach().cpu().numpy()
+                    if arr.size:
+                        bboxes = arr[:, :4].astype('float32')
+                        scores = (arr[:, 4] * arr[:, 5]).astype('float32').reshape(-1,1)
+                        results = np.hstack((bboxes, scores))
+                    else:
+                        results = np.zeros((0,5), dtype='float32')
+                    tracked = tracker.update(results, info_imgs, img_size)
+
+            # フレーム可視化 & 書き込み
+            ev_img = ev.cpu().numpy().squeeze(0)
             frame = ev_repr_to_img(ev_img)
+            if show_pred:
+                if tracker_type == 'iou':
+                    frame = draw_bounding_with_track_id(frame, tracked, dataset2labelmap[data.dataset_name])
+                else:
+                    tlwhs = [t.tlwh for t in tracked]
+                    ids   = [t.track_id for t in tracked]
+                    scores = [t.score for t in tracked]
+                    frame = visualize_bytetrack(frame, tlwhs, ids, scores, dataset2labelmap[data.dataset_name])
+            video_writer.write(frame)
 
-            visualize_bytetrack(
-                writer=video_writer,
-                frame=frame,
-                tlwhs=online_tlwhs,
-                ids=online_ids,
-                scores=online_scores
-            )
-    
     video_writer.release()
-    print("Inference done.")
+    print(f"Video saved at {output_path}")

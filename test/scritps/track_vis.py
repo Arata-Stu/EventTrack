@@ -7,8 +7,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from config.modifier import dynamically_modify_train_config
 from modules.utils.fetch import fetch_data_module, fetch_model_module
-from utils.vis_utils import create_video_with_track, create_video_with_bytetrack
-
+from utils.vis_utils import create_video_with_track
 @hydra.main(config_path="../../config", config_name="visualize_track", version_base="1.2")
 def main(cfg: DictConfig):
     dynamically_modify_train_config(cfg)
@@ -35,9 +34,10 @@ def main(cfg: DictConfig):
     module = fetch_model_module(config=cfg)
         
     ##ビデオの作成
-    if cfg.tracker.name == 'iou':
-        create_video_with_track(data, module, ckpt_path, show_gt, show_pred, output_path, fps, num_sequence, dataset_mode, cfg.tracker)
-    elif cfg.tracker.name == 'bytetrack':
-        create_video_with_bytetrack(data, module, ckpt_path, show_gt, show_pred, output_path, fps, num_sequence, dataset_mode, cfg.tracker)
+    # if cfg.tracker.name == 'iou':
+    #     create_video_with_track(data, module, ckpt_path, show_gt, show_pred, output_path, fps, num_sequence, dataset_mode, cfg.tracker)
+    # elif cfg.tracker.name == 'bytetrack':
+    #     create_video_with_bytetrack(data, module, ckpt_path, show_gt, show_pred, output_path, fps, num_sequence, dataset_mode, cfg.tracker)
+    create_video_with_track(data, module, ckpt_path, show_gt, show_pred, output_path, fps, num_sequence, dataset_mode, cfg.tracker)
 if __name__ == '__main__':
     main()
