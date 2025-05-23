@@ -13,7 +13,7 @@ import torch
 import lightning as pl
 from omegaconf import DictConfig
 from einops import rearrange, reduce
-from typing import Optional
+from typing import Optional, Dict, Any, Tuple
 
 from utils.padding import InputPadderFromShape
 from utils.timers import Timer
@@ -24,7 +24,8 @@ from modules.utils.detection import RNNStates
 from models.layers.yolox.utils.boxes import postprocess, postprocess_with_motion
 from tracker.IoUTracker import IoUTracker 
 from tracker.byte_tracker import BYTETracker
-
+from utils.trackeval.metrics.track_map import TrackMAP
+from utils.helpers import _finalize_sequence_buffer
 LABELMAP_GEN1 = ("car", "pedestrian")
 LABELMAP_GEN4 = ('pedestrian', 'two wheeler', 'car', 'truck', 'bus', 'traffic sign', 'traffic light')
 LABELMAP_GEN4_SHORT = ('pedestrian', 'two wheeler', 'car')
@@ -71,6 +72,26 @@ def get_color_for_id(object_id):
         # (R, G, B) のランダムな色
         color_cache[object_id] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
     return color_cache[object_id]
+
+
+
+def _print_trackmap_summary(metric: TrackMAP, res: dict):
+    """AP/AR テーブルを整形して出力"""
+    lbls = metric.lbls
+    hdr = "IoU   " + " | ".join([f"AP_{l:7s}" for l in lbls]) + " || " + " | ".join([f"AR_{l:7s}" for l in lbls])
+    bar = "-"*len(hdr)
+    print("\n===== TrackMAP Summary =====")
+    print(hdr) ; print(bar)
+    for i, a in enumerate(metric.array_labels):
+        row = f"{a:0.2f} "
+        row += " | ".join([f"{res[f'AP_{l}'][i]:0.3f}" for l in lbls])
+        row += " || "
+        row += " | ".join([f"{res[f'AR_{l}'][i]:0.3f}" for l in lbls])
+        print(row)
+    print(bar)
+    print(f"mAP@[0.50:0.95] (all) = {res['AP_all'].mean():0.3f}\n")
+
+
 
 def ev_repr_to_img(x: np.ndarray):
     ch, ht, wd = x.shape[-3:]
@@ -528,6 +549,7 @@ def create_video(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_
     video_writer.release()
 
 
+
 def create_video_with_track(
     data: pl.LightningDataModule,
     model: pl.LightningModule,
@@ -537,32 +559,37 @@ def create_video_with_track(
     output_path: str,
     fps: int,
     num_sequence: int,
-    dataset_mode: DatasetMode,
-    tracker_cfg: Optional[DictConfig] = None
+    dataset_mode: str,
+    tracker_cfg: Optional[DictConfig] = None,
 ):
-    tracker_type = tracker_cfg.name
-    # --- VideoWriter設定 ---
-    frame_size = dataset2size[data.dataset_name]
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video_writer = cv2.VideoWriter(output_path, fourcc, fps, frame_size)
+    """可視化付き推論 & TrackMAP 計測ユーティリティ"""
 
-    # --- DataLoader & Model準備 ---
+    # ---------------- 0. 初期化 ----------------
+    tracker_type = tracker_cfg.name if tracker_cfg is not None else "bytetrack"
+    frame_size: Tuple[int, int] = dataset2size[data.dataset_name]
+    vw = cv2.VideoWriter(
+        output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, frame_size
+    )
+
+    metric = TrackMAP()
+    seq_buffer: Optional[dict] = None
+    seq_results: dict[str, Any] = {}
+
+    # ---------------- 1. DataModule & Model ----------------
     if dataset_mode == "train":
-        data.setup('fit'); loader = data.train_dataloader(); model.setup('fit')
+        data.setup("fit"); loader = data.train_dataloader(); model.setup("fit")
     elif dataset_mode == "val":
-        data.setup('validate'); loader = data.val_dataloader(); model.setup('validate')
+        data.setup("validate"); loader = data.val_dataloader(); model.setup("validate")
     elif dataset_mode == "test":
-        data.setup('test'); loader = data.test_dataloader(); model.setup('test')
+        data.setup("test"); loader = data.test_dataloader(); model.setup("test")
     else:
-        raise ValueError(f"Invalid dataset mode: {dataset_mode}")
+        raise ValueError("dataset_mode must be 'train', 'val', or 'test'")
 
-    # --- Checkpoint読み込み ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if ckpt_path:
-        ckpt = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(ckpt['state_dict'])
+        state = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(state["state_dict"], strict=False)
 
-    # --- 推論準備 ---
     num_classes = len(dataset2labelmap[data.dataset_name])
     if show_pred:
         model.eval().to(device)
@@ -571,89 +598,146 @@ def create_video_with_track(
 
     sequence_count = 0
     tracker = None
-    info_imgs, img_size = None, None
+    info_imgs: Tuple[int, int] | None = None
+    img_size: List[int] | None = None
 
-    # --- メインループ ---
+    # ---------------- 2. バッチループ ----------------
     for batch in tqdm(loader, desc="Processing Sequences"):
-        ev_repr = batch['data'][DataType.EV_REPR]
-        labels  = batch['data'][DataType.OBJLABELS_SEQ]
-        is_first = batch['data'][DataType.IS_FIRST_SAMPLE]
+        ev_repr = batch["data"][DataType.EV_REPR]  # (T, C, H, W)
+        labels_seq = batch["data"][DataType.OBJLABELS_SEQ]
+        is_first = batch["data"][DataType.IS_FIRST_SAMPLE]
 
+        # RNN hidden state reset
         if show_pred:
             rnn_state.reset(worker_id=0, indices_or_bool_tensor=is_first)
             prev_states = rnn_state.get_states(worker_id=0)
 
-        # 新シーケンス開始
+        # ---------- 新シーケンス検出 ----------
         if is_first.any():
+            # 直前シーケンスを評価
+            if seq_buffer:
+                seq_name = f"seq_{sequence_count:03d}"
+                fin = _finalize_sequence_buffer(seq_buffer)
+                if fin:
+                    seq_results[seq_name] = metric.eval_sequence(fin)
+
             sequence_count += 1
-            if sequence_count > num_sequence:
+            if 0 < num_sequence < sequence_count:
                 break
-            if tracker_type == 'iou':
+
+            # tracker 初期化
+            if tracker_type == "iou":
                 tracker = IoUTracker(max_lost=tracker_cfg.track_buffer, iou_threshold=tracker_cfg.iou_threshold)
-            elif tracker_type == 'bytetrack':
+            elif tracker_type == "bytetrack":
                 tracker = BYTETracker(args=tracker_cfg, frame_rate=fps)
-                h, w = model.in_res_hw
-                info_imgs = (h, w)
-                img_size = [h, w]
+                h, w = model.in_res_hw; info_imgs = (h, w); img_size = [h, w]
             else:
-                raise ValueError(f"Unknown tracker type: {tracker_type}")
+                raise ValueError("Unknown tracker type")
             prev_states = None
 
-        # フレーム単位推論
-        for t in range(len(ev_repr)):
-            ev = ev_repr[t].to(torch.float32).to(device)
+            # バッファ初期化
+            seq_buffer = {
+                "gt_track_ids": [],
+                "dt_track_ids": [],
+                "gt_tracks": [],
+                "dt_tracks": [],
+            }
 
+        # ---------- フレームループ ----------
+        for f_idx in range(len(ev_repr)):
+            ev = ev_repr[f_idx].float().to(device)
+
+            # ===== GT 処理 =====
             if show_gt:
-                cur_labels, valid_idx = labels[t].get_valid_labels_and_batch_indices()
-                # GT描画用 tensor 処理省略
+                cur_objs, _ = labels_seq[f_idx].get_valid_labels_and_batch_indices()
+                if not isinstance(cur_objs, (list, tuple)):
+                    cur_objs = [cur_objs]
+                for lbl in cur_objs:
+                    if len(lbl) == 0:
+                        continue
+                    tids = lbl.track_id.cpu().numpy().astype(int)
+                    xs, ys, ws, hs = [t.cpu().numpy() for t in (lbl.x, lbl.y, lbl.w, lbl.h)]
+                    for tid, x, y, w, h in zip(tids, xs, ys, ws, hs):
+                        try:
+                            pos = seq_buffer["gt_track_ids"].index(tid)
+                        except ValueError:
+                            seq_buffer["gt_track_ids"].append(tid)
+                            seq_buffer["gt_tracks"].append({"boxes": {}})
+                            pos = len(seq_buffer["gt_tracks"]) - 1
+                        seq_buffer["gt_tracks"][pos]["boxes"][f_idx] = np.array([x, y, w, h], dtype=np.float32)
 
+            # ===== 推論 & トラッキング =====
             if show_pred:
-                with Timer(timer_name="Detection + Tracking"):
-                    ev_padded = padder.pad_tensor_ev_repr(ev)
-                    if model.mdl.model_type == 'DNN':
-                        preds, _ = model.forward(event_tensor=ev_padded)
+                with Timer("Det+Track"):
+                    ev_p = padder.pad_tensor_ev_repr(ev)
+                    if model.mdl.model_type == "DNN":
+                        preds, _ = model(event_tensor=ev_p)
                     else:
-                        preds, _, new_states = model.forward(event_tensor=ev_padded, previous_states=prev_states)
+                        preds, _, new_states = model(event_tensor=ev_p, previous_states=prev_states)
                         prev_states = new_states
                         rnn_state.save_states_and_detach(worker_id=0, states=new_states)
 
-                    fmt = model.mdl_config.label.format
-                    if fmt == 'yolox':
-                        dets = postprocess(predictions=preds, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
+                    if model.mdl_config.label.format == "yolox":
+                        dets = postprocess(preds, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
                     else:
                         dets = postprocess_with_motion(prediction=preds, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
 
-                # トラッカー更新
-                if tracker_type == 'iou':
+                # tracker update
+                if tracker_type == "iou":
                     det_list = []
-                    for *box, prev_dx, prev_dy, next_dx, next_dy, class_id in dets[0].cpu().numpy():
-                        x1, y1, x2, y2 = box
+                    for *bb, pdx, pdy, ndx, ndy, cls in dets[0].cpu().numpy():
+                        x1, y1, x2, y2 = bb
                         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                        det_list.append((cx, cy, x2-x1, y2-y1, prev_dx, prev_dy, class_id))
+                        det_list.append((cx, cy, x2 - x1, y2 - y1, pdx, pdy, cls))
                     tracker.update(det_list)
-                    tracked = tracker.get_tracked_objects()
+                    trk_objs = tracker.get_tracked_objects()
                 else:
                     arr = dets[0].detach().cpu().numpy()
                     if arr.size:
-                        bboxes = arr[:, :4].astype('float32')
-                        scores = (arr[:, 4] * arr[:, 5]).astype('float32').reshape(-1,1)
-                        results = np.hstack((bboxes, scores))
+                        bbox = arr[:, :4].astype("float32")
+                        scr = (arr[:, 4] * arr[:, 5]).astype("float32").reshape(-1, 1)
+                        trk_objs = tracker.update(np.hstack((bbox, scr)), info_imgs, img_size)
                     else:
-                        results = np.zeros((0,5), dtype='float32')
-                    tracked = tracker.update(results, info_imgs, img_size)
+                        trk_objs = tracker.update(np.zeros((0, 5), dtype="float32"), info_imgs, img_size)
 
-            # フレーム可視化 & 書き込み
-            ev_img = ev.cpu().numpy().squeeze(0)
-            frame = ev_repr_to_img(ev_img)
+                # TrackMAP バッファ DT
+                for ob in trk_objs:
+                    if hasattr(ob, "tlwh"):
+                        x, y, w, h = ob.tlwh; tid = int(ob.track_id); sc = float(getattr(ob, "score", 1.0))
+                    else:
+                        x, y, w, h = ob["bbox"]; tid = int(ob["track_id"]); sc = 1.0
+                    try:
+                        pos = seq_buffer["dt_track_ids"].index(tid)
+                    except ValueError:
+                        seq_buffer["dt_track_ids"].append(tid)
+                        seq_buffer["dt_tracks"].append({"boxes": {}, "scores": []})
+                        pos = len(seq_buffer["dt_tracks"]) - 1
+                    seq_buffer["dt_tracks"][pos]["boxes"][f_idx] = np.array([x, y, w, h], dtype=np.float32)
+                    seq_buffer["dt_tracks"][pos]["scores"].append(sc)
+
+            # ===== 可視化 =====
+            frame_vis = ev_repr_to_img(ev.cpu().numpy().squeeze(0))
             if show_pred:
-                if tracker_type == 'iou':
-                    frame = draw_bounding_with_track_id(frame, tracked, dataset2labelmap[data.dataset_name])
+                if tracker_type == "iou":
+                    frame_vis = draw_bounding_with_track_id(frame_vis, trk_objs, dataset2labelmap[data.dataset_name])
                 else:
-                    tlwhs = [t.tlwh for t in tracked]
-                    ids   = [t.track_id for t in tracked]
-                    scores = [t.score for t in tracked]
-                    frame = visualize_bytetrack(frame, tlwhs, ids, scores, dataset2labelmap[data.dataset_name])
-            video_writer.write(frame)
+                    tlwhs = [o.tlwh for o in trk_objs]
+                    ids   = [o.track_id for o in trk_objs]
+                    scores = [getattr(o, "score", 1.0) for o in trk_objs]
+                    frame_vis = visualize_bytetrack(frame_vis, tlwhs, ids, scores, dataset2labelmap[data.dataset_name])
+            vw.write(frame_vis)
 
-    video_writer.release()
-    print(f"Video saved at {output_path}")
+    # ---------------- 3. 最終シーケンスを評価 ----------------
+    if seq_buffer:
+        seq_name = f"seq_{sequence_count:03d}"
+        fin = _finalize_sequence_buffer(seq_buffer)
+        if fin:
+            seq_results[seq_name] = metric.eval_sequence(fin)
+
+    vw.release()
+    print(f"Video saved to {output_path}")
+
+    # ---------------- 4. mAP / AR 集計 ----------------
+    if seq_results:
+        ds_res = metric.combine_sequences(seq_results)
+        _print_trackmap_summary(metric, ds_res)
