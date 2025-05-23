@@ -21,6 +21,7 @@ class ObjectLabelBase:
         'dy_prev': 8,
         'dx_next': 9,
         'dy_next': 10,
+        'track_id': 11,
     }
 
     def __init__(self,
@@ -171,6 +172,16 @@ class ObjectLabelBase:
     @dy_next.setter
     def dy_next(self, value: Union[th.Tensor, np.ndarray]):
         self.object_labels[:, self._str2idx['dy_next']] = value
+
+    @property
+    def track_id(self):
+        """Identifier for tracking objects across frames."""
+        return self.object_labels[:, self._str2idx['track_id']]
+
+    @track_id.setter
+    def track_id(self, value: Union[th.Tensor, np.ndarray]):
+        self.object_labels[:, self._str2idx['track_id']] = value
+
 
     @property
     def dtype(self):
