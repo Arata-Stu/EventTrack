@@ -52,7 +52,9 @@ for i in "${!DT_VALUES[@]}"; do
     hardware.num_workers.train=${TRAIN_WORKERS_PER_GPU} hardware.num_workers.eval=${EVAL_WORKERS_PER_GPU} \
     batch_size.train=${BATCH_SIZE_PER_GPU} batch_size.eval=${BATCH_SIZE_PER_GPU} \
     wandb.project_name=${PROJECT} wandb.group_name=${GROUP} wandb.resume_only_weights=True wandb.artifact_name=${ARTIFACT} \
-    dataset.downsample_by_factor_2=${DOWNSAMPLE} 
+    dataset.downsample_by_factor_2=${DOWNSAMPLE} \
+    training.learning_rate=5e-5 \
+    training.lr_scheduler.use=False
     
     echo "Finished training for DT=${DT}"
 done
