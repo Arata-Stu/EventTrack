@@ -73,7 +73,20 @@ def get_color_for_id(object_id):
         color_cache[object_id] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
     return color_cache[object_id]
 
+def convert_to_colormap(gray_img, colormap=cv2.COLORMAP_COOL):
+    """
+    グレースケール画像を0-255に正規化し、ヒートマップ形式でBGRに変換
+    """
+    gray_img = (gray_img - gray_img.min()) / (gray_img.max() - gray_img.min() + 1e-6)
+    gray_img = (gray_img * 255).astype('uint8')
+    color_img = cv2.applyColorMap(gray_img, colormap)
+    return color_img
 
+def backbone_feature_width(index):
+    return {1: 160, 2: 80, 3: 40, 4: 20}[index]
+
+def backbone_feature_height(index):
+    return {1: 96, 2: 48, 3: 24, 4: 12}[index]
 
 def _print_trackmap_summary(metric: TrackMAP, res: dict):
     """AP/AR テーブルを整形して出力"""
@@ -448,7 +461,7 @@ def visualize(video_writer: cv2.VideoWriter, ev_tensors: torch.Tensor, labels_yo
     video_writer.write(img)
 
 
-def create_video(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_path: str ,show_gt: bool, show_pred: bool, output_path: str, fps: int, num_sequence: int, dataset_mode: DatasetMode):  
+def create_video(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_path: str ,show_gt: bool, show_pred: bool, output_path: str, fps: int, num_sequence: int, dataset_mode: DatasetMode, visualize_feature_map: bool = False):  
 
     data_size =  dataset2size[data.dataset_name]
     ## yolox or track
@@ -456,6 +469,15 @@ def create_video(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     video_writer = cv2.VideoWriter(output_path, fourcc, fps, data_size)
+
+    # 特徴マップ動画出力用（4段階の解像度）
+    feature_video_writers = {}
+    if visualize_feature_map:
+        for i in range(1, 5):
+            feature_size = (backbone_feature_width(i), backbone_feature_height(i))  # ↓下で定義します
+            out_path = output_path.replace('.mp4', f'_feature_{i}.mp4')
+            feature_video_writers[i] = cv2.VideoWriter(out_path, fourcc, fps, feature_size)
+
 
 
     if dataset_mode == "train":
@@ -533,7 +555,9 @@ def create_video(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_
                 if model.mdl.model_type == 'DNN':
                     predictions, _ = model.forward(event_tensor=ev_tensors_padded)
                 elif model.mdl.model_type == 'RNN':
-                    predictions, _, states = model.forward(event_tensor=ev_tensors_padded, previous_states=prev_states)
+                    backbone_features, states = model.mdl.forward_backbone(ev_tensors_padded, prev_states)
+                    neck_features = model.mdl.forward_neck(backbone_features)
+                    predictions, losses = model.mdl.forward_head(neck_features)
                     prev_states = states
                     rnn_state.save_states_and_detach(worker_id=0, states=prev_states)
                 
@@ -541,6 +565,14 @@ def create_video(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_
                     pred_processed = postprocess(predictions=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
                 elif format == 'track':
                     pred_processed = postprocess_with_motion(prediction=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
+
+            if visualize_feature_map and show_pred:
+                for i in range(1, 5):
+                    fmap = backbone_features[i]  # [B, C, H, W]
+                    fmap_avg = fmap.mean(dim=1).squeeze(0)  # [H, W]
+                    fmap_np = fmap_avg.detach().cpu().numpy()
+                    fmap_img = convert_to_colormap(fmap_np)
+                    feature_video_writers[i].write(fmap_img)
 
             ## 可視化
             visualize(video_writer, ev_tensors, labels_yolox, pred_processed, data.dataset_name, model.mdl_config.head.motion_branch_mode)

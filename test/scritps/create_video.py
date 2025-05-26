@@ -24,6 +24,7 @@ def main(cfg: DictConfig):
     num_sequence = cfg.num_sequence
     dataset_mode = cfg.dataset_mode
     ckpt_path = cfg.ckpt_path
+    visualize_feature_map = cfg.visualize_feature_map
 
     dir_name = os.path.dirname(output_path)
     if dir_name and not os.path.exists(dir_name):
@@ -35,7 +36,7 @@ def main(cfg: DictConfig):
     module = fetch_model_module(config=cfg)
         
     ##ビデオの作成
-    create_video(data, module, ckpt_path, show_gt, show_pred, output_path, fps, num_sequence, dataset_mode)
+    create_video(data, module, ckpt_path, show_gt, show_pred, output_path, fps, num_sequence, dataset_mode, visualize_feature_map)
 
 if __name__ == '__main__':
     main()
