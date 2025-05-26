@@ -1,3 +1,5 @@
 name: iou ## iou or bytetrack
 iou_threshold: 0.3
 track_buffer: 3
+cost_threshold: 0.8
+vel_weight: 0.25
