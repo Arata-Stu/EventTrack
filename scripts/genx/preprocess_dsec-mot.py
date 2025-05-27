@@ -27,7 +27,7 @@ def convert_txt_to_npy_only_for_split(input_dir: Path, split_yaml: Path):
 
     for name in split_names:
         txt_path = input_dir / name / "tracking" / f"{name}.txt"
-        npy_path = input_dir / name / "tracking" / f"{name}.npy"
+        npy_path = input_dir / name / "tracking" / "tracks.npy"
 
         if not txt_path.exists():
             print(f"⚠️ {txt_path} が存在しません。スキップします。")
