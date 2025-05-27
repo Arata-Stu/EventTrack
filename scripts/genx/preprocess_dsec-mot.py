@@ -756,7 +756,7 @@ if __name__ == '__main__':
     os.makedirs(target_dir, exist_ok=True)
 
     # --- split_config の読み込み ---
-    with open("dsec_split.yaml", 'r') as f:
+    with open("dsec_mot_split.yaml", 'r') as f:
         split_config = OmegaConf.load(f)
 
     split_names = {
