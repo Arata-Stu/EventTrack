@@ -3,7 +3,7 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 def load_tracks_txt_as_dsec_det_format(txt_path: Path):
-    # DSEC-DET に合わせた dtype
+    # 正しい dtype に従い構造化配列に変換
     dtype = np.dtype([
         ('t', '<u8'),
         ('x', '<f4'),
@@ -15,29 +15,34 @@ def load_tracks_txt_as_dsec_det_format(txt_path: Path):
         ('track_id', '<u4')
     ])
 
-    # 生データ読み込み（自動型推定）
-    raw = np.genfromtxt(txt_path, delimiter=',', dtype=None, encoding=None)
+    # 生データ読み込み（float64やintなどで推定）
+    raw = np.genfromtxt(txt_path, delimiter=',', dtype=float)
 
-    # 1行だけの場合を考慮
+    # 1行だけだった場合に備えて形状を強制変換
     if raw.ndim == 1:
         raw = np.expand_dims(raw, axis=0)
 
-    # 項目抽出（DSEC-MOT形式と仮定：t, id, x, y, w, h, class_id）
+    # 7列なことを確認
+    if raw.shape[1] != 7:
+        raise ValueError(f"{txt_path} の列数が7ではありません（{raw.shape[1]}列）")
+
+    # 項目整列して構造化配列に変換
     structured = np.array([
         (
-            int(row[0]),        # timestamp
+            int(row[0]),        # t (timestamp)
             float(row[2]),      # x
             float(row[3]),      # y
             float(row[4]),      # w
             float(row[5]),      # h
             int(row[6]),        # class_id
-            1.0,                # class_confidence (固定)
+            1.0,                # class_confidence（固定）
             int(row[1])         # track_id
         )
         for row in raw
     ], dtype=dtype)
 
     return structured
+
 
 def convert_txt_to_npy_as_dsec_det(input_dir: Path, split_yaml: Path):
     split_cfg = OmegaConf.load(split_yaml)
