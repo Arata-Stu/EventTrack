@@ -789,7 +789,7 @@ if __name__ == '__main__':
         os.makedirs(d, exist_ok=True)
 
     def create_sequence_data(seq_dir: Path, split_type: SplitType, out_parent: Path) -> Optional[Dict]:
-        label_file = seq_dir / "object_detections" / "left" / "tracks_with_motion.npy"
+        label_file = seq_dir / "tracking" / "tracks_with_motion.npy"
         event_file = seq_dir / "events" / "left" / "events.h5"
         if not label_file.exists():
             print(f"シーケンス {seq_dir.name} のラベルファイルが見つかりません")

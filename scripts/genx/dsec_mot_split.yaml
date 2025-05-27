@@ -13,3 +13,7 @@ train:
 test:
   - interlaken_00_d
   - zurich_city_00_b
+
+val:
+  - interlaken_00_d
+  - zurich_city_00_b
