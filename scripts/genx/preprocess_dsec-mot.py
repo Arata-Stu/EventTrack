@@ -386,6 +386,9 @@ def labels_and_ev_repr_timestamps(npy_file: Path,
                                     dataset_type=dataset_type)
     if sequence_labels.size == 0:
         raise NoLabelsException
+    
+    order = np.argsort(sequence_labels['t'])
+    sequence_labels = sequence_labels[order]
 
     unique_ts_us = np.unique(np.asarray(sequence_labels['t'], dtype='int64'))
 
