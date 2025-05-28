@@ -562,7 +562,7 @@ def create_video(data: pl.LightningDataModule , model: pl.LightningModule, ckpt_
                     rnn_state.save_states_and_detach(worker_id=0, states=prev_states)
                 
                 if format == 'yolox':
-                    pred_processed = postprocess(predictions=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
+                    pred_processed = postprocess(predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
                 elif format == 'track':
                     pred_processed = postprocess_with_motion(prediction=predictions, num_classes=num_classes, conf_thre=0.1, nms_thre=0.45)
 

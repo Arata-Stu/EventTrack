@@ -8,12 +8,14 @@ SIZE=tiny ## tiny small base
 DATASET=gen4 ## gen1, gen4, VGA (640*480 ev cam)
 
 GT=False # add gt to video
-PREDICTION=False # add prediction to video
-num_sequence=1
+PREDICTION=True # add prediction to video
+FEATURE=False # add feature to video
+num_sequence=5
 USE_BEST=True # True: best.ckpt, False: last.ckpt
 
+
 for DT in "${DT_VALUES[@]}"; do
-    DATA_DIR="/home/aten-22/dataset/${DATASET}_preprocessed_bins_${T_BIN}/dt_${DT}"
+    DATA_DIR="/media/arata-22/AT_SSD/dataset/${DATASET}_preprocessed_bins_${T_BIN}/dt_${DT}"
 
     # gtとpredによるサフィックスを作成
     SUFFIX=""
@@ -34,10 +36,10 @@ for DT in "${DT_VALUES[@]}"; do
     else
         CKPT_NAME="last.ckpt"
     fi
-    CKPT_PATH="./ckpts/${MODEL}_${DATASET}_bins_${T_BIN}/dt_${DT}_${CKPT_NAME}"
+    CKPT_PATH="/home/arata-22/Downloads/rvt/${MODEL}_${DATASET}_bins_${T_BIN}/dt_${DT}_${CKPT_NAME}"
 
     python3 create_video.py \
         model=${MODEL} +model/${MODEL}=${SIZE}.yaml model.backbone.input_channels=${CHANNEL} \
         dataset=${DATASET} dataset.path=${DATA_DIR} dataset.ev_repr_name="'stacked_histogram_dt=${DT}_nbins=${T_BIN}'" \
-        output_path=${OUTPUT_VIDEO} gt=${GT} pred=${PREDICTION} num_sequence=${num_sequence} ckpt_path=${CKPT_PATH}
+        output_path=${OUTPUT_VIDEO} gt=${GT} visualize_feature_map=${FEATURE} pred=${PREDICTION} num_sequence=${num_sequence} ckpt_path=${CKPT_PATH} model.label.format='yolox' model.head.motion_branch_mode=null
 done
