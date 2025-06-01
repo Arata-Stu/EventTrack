@@ -364,6 +364,15 @@ class YOLOXHead(nn.Module):
         # 次の 2 チャンネルをサイズにデコード
         output[..., 2:4] = torch.exp(output[..., 2:4]) * stride
 
+        # === ここから修正 ===
+        if self.motion_branch_mode:
+            motion_dim_start_idx = 5 + self.num_classes
+            # motion の各成分 (dx, dy など) にストライドを乗算
+            # output[..., motion_dim_start_idx:] は (batch_size, num_anchors_this_level, motion_dim)
+            # stride はスカラーなので、ブロードキャストされて乗算される
+            output[..., motion_dim_start_idx:] = output[..., motion_dim_start_idx:] * stride
+        # === ここまで修正 ===
+
         return output, grid_flat
 
 
@@ -373,8 +382,9 @@ class YOLOXHead(nn.Module):
             device = outputs.device
             dtype = outputs.dtype
             grids = []
-            strides = []
-            for (hsize, wsize), stride in zip(self.hw, self.strides):
+            strides = [] # 元のローカル変数名を維持
+            # self.strides からストライド値を取り出す際のループ変数も元の 'stride' を使用
+            for (hsize, wsize), stride_val in zip(self.hw, self.strides): # 'stride_val' (または元の'stride')
                 yv, xv = torch.meshgrid(
                     torch.arange(hsize, device=device, dtype=dtype),
                     torch.arange(wsize, device=device, dtype=dtype),
@@ -383,23 +393,43 @@ class YOLOXHead(nn.Module):
                 grid = torch.stack((xv, yv), 2).view(1, -1, 2)
                 grids.append(grid)
                 shape = grid.shape[:2]
-                strides.append(torch.full((*shape, 1), stride, device=device, dtype=dtype))
+                # 元の 'stride' ループ変数を使用する場合は 'stride_val' の部分を 'stride' にする
+                strides.append(torch.full((*shape, 1), stride_val, device=device, dtype=dtype))
             self.output_grids = torch.cat(grids, dim=1)
             self.output_strides = torch.cat(strides, dim=1)
 
+        ### <変更開始 1/3>: bboxとobj_clsのデコード結果を一時変数に格納 ###
         # --- 基本的な bbox decode ---
-        bbox_xy = (outputs[..., 0:2] + self.output_grids) * self.output_strides
-        bbox_wh = torch.exp(outputs[..., 2:4]) * self.output_strides
+        # 元のコードでは、ここで outputs[...] の一部が bbox_xy, bbox_wh に代入されていた
+        bbox_xy_decoded = (outputs[..., 0:2] + self.output_grids) * self.output_strides
+        bbox_wh_decoded = torch.exp(outputs[..., 2:4]) * self.output_strides
 
         # --- obj + clsスコア ---
-        obj_cls = outputs[..., 4:5 + self.num_classes]
+        # 元のコードでは、ここで outputs[...] の一部が obj_cls に代入されていた
+        obj_cls_data = outputs[..., 4:5 + self.num_classes]
+        ### <変更終了 1/3> ###
 
         # --- motionブランチ（あるなら） ---
         if outputs.shape[-1] > 5 + self.num_classes:
-            motion = outputs[..., 5 + self.num_classes:]
-            outputs = torch.cat([bbox_xy, bbox_wh, obj_cls, motion], dim=-1)
+            # motion_raw は元の outputs テンソルからスライス（デコード前）
+            motion_raw = outputs[..., 5 + self.num_classes:]
+
+            ### <追加>: motionデータにストライドを適用してデコード ###
+            motion_decoded = motion_raw * self.output_strides
+            ### <追加終了> ###
+
+            ### <変更開始 2/3>: デコード済みパーツを結合して outputs を更新 ###
+            # 元のコード: outputs = torch.cat([bbox_xy, bbox_wh, obj_cls, motion], dim=-1)
+            #   (ここで motion はデコード前の motion_raw に相当していた)
+            # 変更後: デコードされた各パーツを使用して outputs を再構築
+            outputs = torch.cat([bbox_xy_decoded, bbox_wh_decoded, obj_cls_data, motion_decoded], dim=-1)
+            ### <変更終了 2/3> ###
         else:
-            outputs = torch.cat([bbox_xy, bbox_wh, obj_cls], dim=-1)
+            ### <変更開始 3/3>: motionブランチがない場合もデコード済みパーツで outputs を更新 ###
+            # 元のコード: outputs = torch.cat([bbox_xy, bbox_wh, obj_cls], dim=-1)
+            # 変更後: デコードされたbboxパーツとobj_cls_dataを使用して outputs を再構築
+            outputs = torch.cat([bbox_xy_decoded, bbox_wh_decoded, obj_cls_data], dim=-1)
+            ### <変更終了 3/3> ###
 
         return outputs
 
