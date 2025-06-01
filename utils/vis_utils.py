@@ -367,22 +367,36 @@ def draw_bboxes_with_id(
 
     return img
 
-def draw_bounding_with_track_id(frame, tracked_objs, label_map=None):
+def draw_bounding_with_track_id(frame, tracked_objs, label_map=None, show_score=True):
     """
-    Bounding BoxとTrack IDを描画する関数
+    Bounding Box, Track ID, Class Name, and optionally Scoreを描画する関数
 
     Args:
         frame (np.ndarray): 描画するフレーム
-        tracked_objs (list): [(id, cx, cy, w, h, dx, dy, class_id), ...]
-        label_map (dict): {class_id: class_name} のマッピング情報
+        tracked_objs (list): 追跡されたオブジェクトのリスト。
+                             各要素は (id, cx, cy, w, h, dx, dy, class_id, score) の9要素タプル、
+                             または (id, cx, cy, w, h, dx, dy, class_id) の8要素タプル。
+        label_map (dict, optional): {class_id: class_name} のマッピング情報。
+        show_score (bool, optional): スコアを描画に含めるかどうか。デフォルトは True。
     """
-    for obj_id, cx, cy, w, h, dx, dy, class_id in tracked_objs:
+    for obj_data in tracked_objs:
+        score_val = None  # スコアの初期値
+        if len(obj_data) == 9:  # 9要素タプル (score を含む)
+            obj_id, cx, cy, w, h, dx, dy, class_id, score_val = obj_data
+        elif len(obj_data) == 8:  # 8要素タプル (score を含まない、後方互換性)
+            obj_id, cx, cy, w, h, dx, dy, class_id = obj_data
+        else:
+            # 予期しない要素数の場合はスキップまたは警告
+            print(f"Warning: Unexpected number of elements in tracked_obj: {len(obj_data)}. Skipping.")
+            continue
+
         x1 = int(cx - w / 2)
         y1 = int(cy - h / 2)
         x2 = int(cx + w / 2)
         y2 = int(cy + h / 2)
 
         # 色の取得 (Track IDごとに固定のランダム色)
+        # get_color_for_id 関数が適切に定義されている必要があります
         color = get_color_for_id(obj_id)
 
         # バウンディングボックスの描画
@@ -391,15 +405,20 @@ def draw_bounding_with_track_id(frame, tracked_objs, label_map=None):
         # クラス名の取得
         class_name = label_map[class_id] if label_map and class_id in label_map else str(class_id)
 
-        # ラベルとIDの描画
-        text = f"{class_name} | ID: {obj_id}"
+        # ラベルテキストの作成
+        text_elements = [f"{class_name}", f"ID:{obj_id}"]
+        if show_score and score_val is not None:
+            text_elements.append(f"S:{score_val:.2f}") # スコアを小数点以下2桁で表示
+        
+        text = " | ".join(text_elements)
+
         (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         
         # ラベル表示用の背景
-        cv2.rectangle(frame, (x1, y1 - text_height - 5), (x1 + text_width, y1), color, thickness=-1)
+        cv2.rectangle(frame, (x1, y1 - text_height - 5), (x1 + text_width + 2, y1), color, thickness=-1) # 背景を少し広めに
         
         # ラベルのテキスト描画
-        cv2.putText(frame, text, (x1, y1 - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, text, (x1 + 1, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1) # 位置調整
 
     return frame
 
@@ -740,7 +759,14 @@ def create_video_with_track(
                             next_dx = next_dy = 0.0                     # モーション無しなら 0
 
                         class_id = int(det[6])            # cls_id の列位置は固定なので 6
-                        det_list.append((cx, cy, w, h, next_dx, next_dy, class_id))
+
+                        obj_conf = det[4]
+                        cls_conf = det[5]
+                        score = obj_conf * cls_conf # IoUTrackerに渡すscore
+
+                        det_list.append((cx, cy, w, h, next_dx, next_dy, class_id, score)) # score を追加
+
+                        # det_list.append((cx, cy, w, h, next_dx, next_dy, class_id))
 
                     trk_objs = tracker.update(det_list)
                 else:
