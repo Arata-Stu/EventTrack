@@ -729,9 +729,11 @@ def create_video_with_track(
     # ---------- 2. バッチループ ----------
     for batch in tqdm(loader, desc="Processing Sequences"):
         # DataType.EV_REPR などの Enum が定義されていること
-        ev_repr = batch["data"]["ev_repr"] # DataType.EV_REPR を文字列キーに変更 (仮)
-        labels_seq = batch["data"]["objlabels_seq"] # DataType.OBJLABELS_SEQ を文字列キーに変更 (仮)
-        is_first = batch["data"]["is_first_sample"] # DataType.IS_FIRST_SAMPLE を文字列キーに変更 (仮)
+        data_batch = batch["data"]
+
+        ev_repr = data_batch[DataType.EV_REPR]
+        labels_seq = data_batch[DataType.OBJLABELS_SEQ]
+        is_first = data_batch[DataType.IS_FIRST_SAMPLE]
 
 
         if show_pred:
