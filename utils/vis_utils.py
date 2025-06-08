@@ -205,7 +205,7 @@ def draw_bboxes_with_id(
     boxes: np.ndarray,
     dataset_name: str,
     motion_branch_mode: str = None,
-    motion_scale: float = 5.0,
+    motion_scale: float = 1.0,
     arrow_thickness: int = 3,
     arrow_tip_length: float = 0.3
 ) -> np.ndarray:
@@ -732,15 +732,15 @@ def create_video_with_track(
         data_batch = batch["data"]
 
         ev_repr = data_batch[DataType.EV_REPR]
-        labels_seq = data_batch[DataType.OBJLABELS_SEQ]
-        is_first = data_batch[DataType.IS_FIRST_SAMPLE]
+        labels = data_batch[DataType.OBJLABELS_SEQ]
+        is_first_sample = data_batch[DataType.IS_FIRST_SAMPLE]
 
 
         if show_pred:
-            rnn_state.reset(worker_id=0, indices_or_bool_tensor=is_first)
+            rnn_state.reset(worker_id=0, indices_or_bool_tensor=is_first_sample)
             prev_states = rnn_state.get_states(worker_id=0)
 
-        if is_first.any():
+        if is_first_sample.any():
             print(f"Processing sequence {sequence_count + 1}...")
             if seq_buffer:
                 name = f"seq_{sequence_count:03d}"
@@ -772,11 +772,12 @@ def create_video_with_track(
         # ev_repr が (B, T, C, H, W) や (T, B, C, H, W) の場合、
         # バッチ内の最初のサンプルに対する処理を想定 (B=0)
         # ここでは ev_repr がフレームのリスト (List[Tensor]) または (T, C, H, W) 形式を想定
-        num_frames_in_batch = ev_repr.shape[0] if isinstance(ev_repr, torch.Tensor) else len(ev_repr)
+        sequence_len = len(ev_repr)
 
-        for f_idx in range(num_frames_in_batch):
+        for tidx in range(sequence_len):
             current_global_frame_id += 1
-            current_ev_frame = ev_repr[f_idx].float().to(device)
+            ev_tensors = ev_repr[tidx]
+            ev_tensors = ev_tensors.to(torch.float32).to(device)  # デバイスに移動
 
             frame_gt_tlwhs_mot: List[List[float]] = []
             frame_gt_ids_mot: List[int] = []
@@ -790,7 +791,7 @@ def create_video_with_track(
             if show_gt:
                 # labels_seq[f_idx] が ObjectLabels インスタンスを返すことを期待
                 # ObjectLabels クラスに get_valid_labels_and_batch_indices メソッドが存在すること
-                cur_objs_list, _ = labels_seq[f_idx].get_valid_labels_and_batch_indices()
+                cur_objs_list, _ = labels[tidx].get_valid_labels_and_batch_indices()
                 if not isinstance(cur_objs_list, (list, tuple)):
                     cur_objs_list = [cur_objs_list]
 
@@ -832,14 +833,14 @@ def create_video_with_track(
             if show_pred:
                 # Timer クラスが定義されていること
                 # with Timer("Det+Track"): # Timer クラスがない場合はコメントアウト
-                ev_p = padder.pad_tensor_ev_repr(current_ev_frame.unsqueeze(0)) # バッチ次元を追加
+                ev_tensors_padded = padder.pad_tensor_ev_repr(ev_tensors) # バッチ次元を追加
                 
                 if model.mdl.model_type == "DNN":
-                    preds, _ = model(event_tensor=ev_p)
+                    preds, _ = model(event_tensor=ev_tensors_padded)
                 else: # RNN
                     # preds, _, new_states = model(event_tensor=ev_p, previous_states=prev_states)
                     # model が (preds, features, states) を返す場合
-                    output_tuple = model(event_tensor=ev_p, previous_states=prev_states)
+                    output_tuple = model(event_tensor=ev_tensors_padded, previous_states=prev_states)
                     if len(output_tuple) == 3: # (preds, features, states)
                         preds, _, new_states = output_tuple
                     elif len(output_tuple) == 2: # (preds, states) - featuresがない場合
@@ -924,7 +925,7 @@ def create_video_with_track(
 
             # ===== 可視化 =====
             # ev_repr_to_img, draw_bounding_with_track_id, visualize_bytetrack が定義されていること
-            frame_to_write = ev_repr_to_img(current_ev_frame.cpu().numpy().squeeze(0))
+            frame_to_write = ev_repr_to_img(ev_tensors.cpu().numpy().squeeze(0))
             if show_pred:
                 if tracker_type == "iou":
                     frame_to_write = draw_bounding_with_track_id(frame_to_write, trk_objs_for_vis, dataset2labelmap[data.dataset_name])
