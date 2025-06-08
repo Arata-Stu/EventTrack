@@ -533,14 +533,14 @@ class YOLOXHead(nn.Module):
                     dxp, dyp, dxn, dyn = gt_motion[:,0], gt_motion[:,1], gt_motion[:,2], gt_motion[:,3]
                     ratio_prev = torch.maximum(torch.abs(dxp)/(torch.abs(dyp)+eps), torch.abs(dyp)/(torch.abs(dxp)+eps))
                     ratio_next = torch.maximum(torch.abs(dxn)/(torch.abs(dyn)+eps), torch.abs(dyn)/(torch.abs(dxn)+eps))
-                    mask_prev = (mag_prev<=20.0)&(ratio_prev<=10.0)&(torch.abs(dxp)<=30.0)&(torch.abs(dyp)<=30.0)
-                    mask_next = (mag_next<=20.0)&(ratio_next<=10.0)&(torch.abs(dxn)<=30.0)&(torch.abs(dyn)<=30.0)
+                    mask_prev = (mag_prev<=20.0)&(ratio_prev<=25.0)&(torch.abs(dxp)<=30.0)&(torch.abs(dyp)<=10.0)
+                    mask_next = (mag_next<=20.0)&(ratio_next<=25.0)&(torch.abs(dxn)<=30.0)&(torch.abs(dyn)<=10.0)
                     reliable_mask = mask_prev & mask_next
                 else:
                     mag = torch.norm(gt_motion, dim=1)
                     dx, dy = gt_motion[:,0], gt_motion[:,1]
                     ratio = torch.maximum(torch.abs(dx)/(torch.abs(dy)+1e-6), torch.abs(dy)/(torch.abs(dx)+1e-6))
-                    reliable_mask = (mag<=20.0)&(ratio<=10.0)&(torch.abs(dx)<=30.0)&(torch.abs(dy)<=30.0)
+                    reliable_mask = (mag<=20.0)&(ratio<=25.0)&(torch.abs(dx)<=30.0)&(torch.abs(dy)<=10.0)
 
                 # --- 予測を fg_mask で抽出 → matched_inds ベースの reliable_mask でフィルタ ---
                 pred_motion = motion_preds[i][fg_mask]  # [num_fg, motion_dim]
